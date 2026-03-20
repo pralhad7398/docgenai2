@@ -218,6 +218,195 @@ app.get('/api/report', (req,res)=>{
   res.send(md);
 });
 
+// ── OpenRouter AI helpers ─────────────────────────────────────────────────────
+const OPENROUTER_KEY   = process.env.OPENROUTER_API_KEY || '';
+const OPENROUTER_MODEL = process.env.OPENROUTER_MODEL   || 'mistralai/mistral-7b-instruct:free';
+
+async function callAI(systemPrompt, userPrompt) {
+  if (!OPENROUTER_KEY) throw new Error('OPENROUTER_API_KEY not set');
+  const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENROUTER_KEY}`,
+      'Content-Type':  'application/json',
+      'HTTP-Referer':  'https://issueai.app',
+      'X-Title':       'IssueAI',
+    },
+    body: JSON.stringify({
+      model: OPENROUTER_MODEL,
+      max_tokens: 2000,
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user',   content: userPrompt   },
+      ],
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`OpenRouter error ${res.status}: ${err}`);
+  }
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content || '';
+}
+
+function safeParseJSON(text) {
+  // Strip markdown code fences if present
+  const clean = text.replace(/```json|```/g,'').trim();
+  return JSON.parse(clean);
+}
+
+// ── POST /api/ai/classify — classify all untagged issues ──────────────────────
+app.post('/api/ai/classify', async (req, res) => {
+  const issues = db.list({}).filter(i => !i.category || !i.root_cause);
+  if (!issues.length) return res.json({ updated: 0, message: 'All issues already classified' });
+
+  const SYSTEM = `You are a software engineering analyst. Classify each issue and return ONLY a valid JSON array. No markdown, no explanation.`;
+  const issueList = issues.map((i,n) =>
+    `${n+1}. [${i.severity}] ${i.title} — ${i.description||i.title} (Project: ${i.project}, Reporter: ${i.reporter})`
+  ).join('\n');
+
+  const USER = `Classify these ${issues.length} software project issues. Return a JSON array with one object per issue in this exact format:
+[
+  {
+    "index": 1,
+    "category": "one of: technical|process|security|quality|environment|communication|other",
+    "severity": "one of: critical|high|medium|low",
+    "root_cause": "concise 1 sentence root cause hypothesis"
+  }
+]
+
+Issues:
+${issueList}`;
+
+  try {
+    const text   = await callAI(SYSTEM, USER);
+    const parsed = safeParseJSON(text);
+    let updated  = 0;
+    for (const item of parsed) {
+      const issue = issues[item.index - 1];
+      if (!issue) continue;
+      db.update(issue.id, {
+        category:   item.category   || issue.category,
+        root_cause: item.root_cause || issue.root_cause,
+        severity:   item.severity   || issue.severity,
+      });
+      updated++;
+    }
+    res.json({ updated, message: `Classified ${updated} issues using AI` });
+  } catch(e) {
+    console.error('classify error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/ai/analyse — full analysis of all issues ────────────────────────
+app.post('/api/ai/analyse', async (req, res) => {
+  const issues = db.list({});
+  const stats  = db.stats();
+  if (!issues.length) return res.status(400).json({ error: 'No issues to analyse' });
+
+  const SYSTEM = `You are a senior engineering manager analysing project issues. Return ONLY valid JSON, no markdown fences, no explanation.`;
+
+  const issueList = issues.map((i,n) =>
+    `${n+1}. [${i.severity?.toUpperCase()}] ${i.title} | Project: ${i.project} | Category: ${i.category||'unknown'} | Reporter: ${i.reporter} | Status: ${i.status}`
+  ).join('\n');
+
+  const USER = `Analyse these ${issues.length} project issues and return a JSON object:
+{
+  "executive_summary": "3-4 sentence summary of the team's current situation",
+  "team_health_score": <number 0-10>,
+  "team_health_reasoning": "one sentence explanation of the score",
+  "top_risks": ["risk 1", "risk 2", "risk 3"],
+  "recurring_patterns": [
+    { "pattern": "short pattern name", "affected_projects": ["proj"], "count": N, "recommended_action": "specific action" }
+  ],
+  "root_causes": [
+    { "cause": "root cause name", "frequency": "high|medium|low", "description": "one sentence" }
+  ],
+  "recommendations": [
+    { "priority": "immediate|short_term|long_term", "action": "specific action", "rationale": "why this matters" }
+  ]
+}
+
+Issues:
+${issueList}
+
+Stats: Total=${stats.total}, Open=${stats.open}, Critical=${stats.critical}, Resolved=${stats.resolved}`;
+
+  try {
+    const text   = await callAI(SYSTEM, USER);
+    const parsed = safeParseJSON(text);
+    // Cache result in store
+    store.last_analysis = { ...parsed, generated_at: new Date().toISOString() };
+    saveStore();
+    res.json(parsed);
+  } catch(e) {
+    console.error('analyse error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── POST /api/ai/report — AI-written full markdown report ─────────────────────
+app.post('/api/ai/report', async (req, res) => {
+  const issues = db.list({});
+  const stats  = db.stats();
+  const cached = store.last_analysis;
+
+  const SYSTEM = `You are a technical writer. Generate a professional Markdown report. Use proper Markdown formatting with headers, tables and bullet points.`;
+
+  const issueRows = issues.slice(0,20).map((i,n) =>
+    `| ${n+1} | ${i.title} | ${i.project} | ${i.severity} | ${i.category||'—'} | ${i.status} |`
+  ).join('\n');
+
+  const analysisCtx = cached
+    ? `Previous AI analysis summary: ${cached.executive_summary}\nTeam health: ${cached.team_health_score}/10`
+    : `Stats: ${stats.total} total, ${stats.open} open, ${stats.critical} critical, health score ${stats.health}/10`;
+
+  const USER = `Write a complete project issues intelligence report in Markdown.
+
+${analysisCtx}
+
+Projects: ${stats.byProj.map(p=>p.project).join(', ')}
+Date: ${new Date().toLocaleDateString('en-IN',{dateStyle:'long'})}
+
+Issue register (top 20):
+| # | Title | Project | Severity | Category | Status |
+|---|-------|---------|----------|----------|--------|
+${issueRows}
+
+Include these sections:
+1. Executive Summary
+2. Key Metrics (table)
+3. Issue Analysis by Category
+4. Recurring Patterns & Root Causes
+5. Risk Assessment
+6. Prioritised Recommendations (Immediate / Short term / Long term)
+7. Issue Register
+8. Next Steps`;
+
+  try {
+    const markdown = await callAI(SYSTEM, USER);
+    store.last_report = { content: markdown, generated_at: new Date().toISOString() };
+    saveStore();
+    res.setHeader('Content-Type', 'text/markdown');
+    res.setHeader('Content-Disposition', 'attachment; filename="issueai-ai-report.md"');
+    res.send(markdown);
+  } catch(e) {
+    console.error('report error:', e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── GET /api/ai/status — check if AI is configured ───────────────────────────
+app.get('/api/ai/status', (_,res) => {
+  res.json({
+    configured: !!OPENROUTER_KEY,
+    model: OPENROUTER_MODEL,
+    last_analysis: store.last_analysis?.generated_at || null,
+    last_report:   store.last_report?.generated_at   || null,
+  });
+});
+
 // ── Serve the full SPA (HTML+CSS+JS all inlined) ──────────────────────────────
 app.get('*', (req,res)=>res.send(HTML));
 
@@ -228,1431 +417,1145 @@ app.listen(PORT, '0.0.0.0', ()=>console.log(`⚡ IssueAI on http://0.0.0.0:${POR
 // FULL UI — HTML + CSS + JS all inlined below
 // ══════════════════════════════════════════════════════════════════════════════
 
+
+
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0"/>
 <title>IssueAI — Project Intelligence</title>
-<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@400;600;700;800&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Syne:wght@700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet"/>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 :root{
-  --bg:#0d0f14;
-  --bg2:#13161e;
-  --bg3:#1a1e28;
-  --bg4:#222736;
-  --border:#2a2f3f;
-  --border2:#343b52;
-  --text:#e8eaf0;
-  --text2:#9097b0;
-  --text3:#555e78;
-  --accent:#6c63ff;
-  --accent2:#8b85ff;
-  --red:#ff4d4d;
-  --orange:#ff9933;
-  --yellow:#ffd24d;
-  --green:#2ecc8a;
-  --blue:#4d9fff;
-  --teal:#26c6b0;
-  --font-display:'Syne',sans-serif;
-  --font-body:'DM Sans',sans-serif;
-  --font-mono:'DM Mono',monospace;
+  --bg:#09090b;--bg2:#111113;--bg3:#18181b;--bg4:#27272a;
+  --border:#27272a;--border2:#3f3f46;
+  --text:#fafafa;--text2:#a1a1aa;--text3:#52525b;
+  --accent:#7c3aed;--accent2:#8b5cf6;--accent3:#ede9fe;
+  --red:#ef4444;--red2:#fca5a5;--redbg:#1c0a0a;
+  --orange:#f97316;--orangebg:#1c0f0a;
+  --green:#22c55e;--green2:#86efac;--greenbg:#0a1c0f;
+  --blue:#3b82f6;--bluebg:#0a0f1c;
+  --yellow:#eab308;--yellowbg:#1c1a0a;
+  --teal:#14b8a6;
+  --font-d:'Syne',sans-serif;
+  --font-b:'Inter',sans-serif;
+  --font-m:'DM Mono',monospace;
+  --r:10px;--r-sm:6px;--r-lg:14px;
 }
-body{background:var(--bg);color:var(--text);font-family:var(--font-body);font-size:14px;min-height:100vh;overflow-x:hidden}
-::-webkit-scrollbar{width:5px;height:5px}
-::-webkit-scrollbar-track{background:var(--bg2)}
-::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
+body{background:var(--bg);color:var(--text);font-family:var(--font-b);font-size:14px;min-height:100vh;line-height:1.5}
+::-webkit-scrollbar{width:4px;height:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+
+/* ── LAYOUT ── */
+.sidebar{position:fixed;left:0;top:0;bottom:0;width:232px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100}
+.main{margin-left:232px;min-height:100vh;display:flex;flex-direction:column;background:var(--bg)}
 
 /* ── SIDEBAR ── */
-.sidebar{position:fixed;left:0;top:0;bottom:0;width:220px;background:var(--bg2);border-right:1px solid var(--border);display:flex;flex-direction:column;z-index:100}
-.logo{padding:24px 20px 20px;font-family:var(--font-display);font-size:16px;font-weight:800;letter-spacing:-0.3px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)}
-.logo-icon{width:32px;height:32px;background:var(--accent);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0}
-.logo span{color:var(--text2);font-weight:400;font-size:11px;display:block;margin-top:1px}
-.nav{padding:16px 12px;flex:1;display:flex;flex-direction:column;gap:2px}
-.nav-item{display:flex;align-items:center;gap:10px;padding:9px 12px;border-radius:8px;cursor:pointer;transition:all 0.15s;color:var(--text2);font-size:13px;font-weight:500;position:relative;user-select:none}
+.logo{padding:20px 18px 16px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--border)}
+.logo-mark{width:32px;height:32px;background:var(--accent);border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:15px;flex-shrink:0;box-shadow:0 0 0 4px rgba(124,58,237,.15)}
+.logo-name{font-family:var(--font-d);font-size:15px;font-weight:800;letter-spacing:-.3px}
+.logo-tag{font-size:10px;color:var(--text3);margin-top:1px;font-weight:400}
+.nav{padding:12px 10px;flex:1;display:flex;flex-direction:column;gap:1px}
+.nav-section{font-size:9px;color:var(--text3);text-transform:uppercase;letter-spacing:1.2px;font-weight:600;padding:10px 8px 5px}
+.nav-item{display:flex;align-items:center;gap:9px;padding:8px 10px;border-radius:var(--r-sm);cursor:pointer;transition:all .12s;color:var(--text2);font-size:13px;font-weight:500;position:relative;user-select:none;border:1px solid transparent}
 .nav-item:hover{background:var(--bg3);color:var(--text)}
-.nav-item.active{background:var(--bg4);color:var(--text);border:1px solid var(--border2)}
-.nav-item.active::before{content:'';position:absolute;left:0;top:50%;transform:translateY(-50%);width:3px;height:60%;background:var(--accent);border-radius:0 2px 2px 0}
-.nav-icon{font-size:15px;width:18px;text-align:center}
-.nav-badge{margin-left:auto;background:var(--red);color:#fff;font-size:10px;font-weight:700;padding:2px 6px;border-radius:20px;font-family:var(--font-mono)}
-.nav-badge.green{background:var(--green);color:#0d1a12}
-.sidebar-footer{padding:16px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px}
-.avatar{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,#6c63ff,#26c6b0);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff;flex-shrink:0}
-.user-name{font-size:12px;font-weight:500}
-.user-role{font-size:11px;color:var(--text3)}
+.nav-item.active{background:rgba(124,58,237,.12);color:var(--text);border-color:rgba(124,58,237,.25)}
+.nav-item.active .nav-icon{color:var(--accent2)}
+.nav-icon{font-size:14px;width:16px;text-align:center;flex-shrink:0}
+.nav-badge{margin-left:auto;font-size:10px;font-weight:600;padding:1px 6px;border-radius:20px;font-family:var(--font-m);background:var(--red);color:#fff}
+.nav-badge.ok{background:var(--greenbg);color:var(--green);border:1px solid rgba(34,197,94,.2)}
+.nav-badge.ai{background:rgba(124,58,237,.2);color:var(--accent2);border:1px solid rgba(124,58,237,.3);animation:abadge 2s infinite}
+@keyframes abadge{0%,100%{box-shadow:0 0 0 0 rgba(124,58,237,.4)}50%{box-shadow:0 0 0 3px rgba(124,58,237,0)}}
+.sidebar-footer{padding:12px 14px;border-top:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.av{width:30px;height:30px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--teal));display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;flex-shrink:0}
+.av-name{font-size:12px;font-weight:600}
+.av-role{font-size:11px;color:var(--text3)}
+.status-online{width:7px;height:7px;border-radius:50%;background:var(--green);margin-left:auto;flex-shrink:0}
 
 /* ── TOPBAR ── */
-.main{margin-left:220px;min-height:100vh;display:flex;flex-direction:column}
-.topbar{padding:16px 28px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:16px;background:var(--bg2);position:sticky;top:0;z-index:50}
-.page-title{font-family:var(--font-display);font-size:18px;font-weight:700}
-.topbar-actions{margin-left:auto;display:flex;gap:10px;align-items:center}
+.topbar{padding:14px 24px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;background:rgba(9,9,11,.8);backdrop-filter:blur(16px);position:sticky;top:0;z-index:50}
+.page-title{font-family:var(--font-d);font-size:16px;font-weight:800;letter-spacing:-.3px}
+.page-sub{font-size:11px;color:var(--text3);margin-left:2px}
+.topbar-right{margin-left:auto;display:flex;gap:8px;align-items:center}
 .search-wrap{position:relative}
-.search-wrap::before{content:'⌕';position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3);font-size:14px;z-index:1;pointer-events:none}
-.search-bar{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:7px 12px 7px 32px;color:var(--text);font-size:13px;outline:none;width:220px;font-family:var(--font-body);transition:border-color .15s}
-.search-bar:focus{border-color:var(--accent)}
+.search-icon{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--text3);font-size:13px;pointer-events:none}
+.search-bar{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);padding:7px 12px 7px 30px;color:var(--text);font-size:12px;outline:none;width:200px;font-family:var(--font-b);transition:border-color .15s;color:var(--text)}
+.search-bar::placeholder{color:var(--text3)}
+.search-bar:focus{border-color:var(--accent);background:var(--bg2)}
 
 /* ── BUTTONS ── */
-.btn{padding:7px 16px;border-radius:8px;border:none;cursor:pointer;font-family:var(--font-body);font-size:12px;font-weight:500;display:inline-flex;align-items:center;gap:6px;transition:all 0.15s;white-space:nowrap;text-decoration:none}
+.btn{padding:7px 14px;border-radius:var(--r-sm);border:none;cursor:pointer;font-family:var(--font-b);font-size:12px;font-weight:500;display:inline-flex;align-items:center;gap:5px;transition:all .12s;white-space:nowrap;line-height:1}
 .btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{background:var(--accent2)}
-.btn-secondary{background:var(--bg3);color:var(--text);border:1px solid var(--border2)}.btn-secondary:hover{background:var(--bg4)}
-.btn-danger{background:#2d1515;color:var(--red);border:1px solid #3d1f1f}
-.btn-success{background:#0d2018;color:var(--green);border:1px solid #1a3828}
-.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-secondary{background:var(--bg3);color:var(--text2);border:1px solid var(--border)}.btn-secondary:hover{background:var(--bg4);color:var(--text)}
+.btn-ghost{background:transparent;color:var(--text3);border:1px solid var(--border)}.btn-ghost:hover{color:var(--text);background:var(--bg3)}
+.btn-danger{background:var(--redbg);color:var(--red);border:1px solid rgba(239,68,68,.2)}.btn-danger:hover{background:rgba(239,68,68,.15)}
+.btn-success{background:var(--greenbg);color:var(--green);border:1px solid rgba(34,197,94,.2)}
+.btn-ai{background:linear-gradient(135deg,var(--accent),#6d28d9);color:#fff;font-weight:600}.btn-ai:hover{opacity:.9}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn-sm{padding:5px 10px;font-size:11px}
+.btn-lg{padding:9px 18px;font-size:13px;font-weight:600}
 
-/* ── CONTENT / TABS ── */
-.content{padding:24px 28px;flex:1}
+/* ── CONTENT ── */
+.content{padding:22px 24px;flex:1}
 .tab-panels>div{display:none}
-.tab-panels>div.active{display:block;animation:fadeUp .22s ease both}
-@keyframes fadeUp{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+.tab-panels>div.active{display:block;animation:fadeUp .18s ease both}
+@keyframes fadeUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.page-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+.page-header h1{font-family:var(--font-d);font-size:18px;font-weight:800}
+.page-header p{font-size:12px;color:var(--text3);margin-top:2px}
 
-/* ── KPI ── */
-.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:22px}
-.kpi-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:18px 20px;position:relative;overflow:hidden;transition:border-color .2s}
-.kpi-card:hover{border-color:var(--border2)}
-.kpi-card::after{content:'';position:absolute;top:0;left:0;right:0;height:2px}
-.kpi-card.red::after{background:var(--red)}.kpi-card.orange::after{background:var(--orange)}.kpi-card.green::after{background:var(--green)}.kpi-card.accent::after{background:var(--accent)}.kpi-card.blue::after{background:var(--blue)}
-.kpi-label{font-size:11px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;font-weight:600;margin-bottom:10px}
-.kpi-value{font-family:var(--font-display);font-size:34px;font-weight:800;line-height:1}
-.kpi-value.red{color:var(--red)}.kpi-value.orange{color:var(--orange)}.kpi-value.green{color:var(--green)}.kpi-value.accent{color:var(--accent)}.kpi-value.blue{color:var(--blue)}
-.kpi-sub{font-size:11px;color:var(--text3);margin-top:6px}.kpi-sub b{color:var(--green)}
-.kpi-bg-num{position:absolute;right:-4px;bottom:-10px;font-family:var(--font-display);font-size:64px;font-weight:800;opacity:.05;line-height:1;pointer-events:none}
+/* ── CARDS ── */
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r)}
+.card-header{padding:14px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.card-title{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.7px}
+.card-body{padding:16px}
+
+/* ── KPI GRID ── */
+.kpi-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}
+.kpi{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:16px 18px;position:relative;overflow:hidden;transition:border-color .15s,transform .15s;cursor:default}
+.kpi:hover{border-color:var(--border2);transform:translateY(-1px)}
+.kpi-accent{border-top:2px solid var(--accent)}
+.kpi-red{border-top:2px solid var(--red)}
+.kpi-orange{border-top:2px solid var(--orange)}
+.kpi-green{border-top:2px solid var(--green)}
+.kpi-label{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.9px;font-weight:600;margin-bottom:8px;display:flex;align-items:center;gap:5px}
+.kpi-value{font-family:var(--font-d);font-size:32px;font-weight:800;line-height:1}
+.kpi-value.c-accent{color:var(--accent2)}.kpi-value.c-red{color:var(--red)}.kpi-value.c-orange{color:var(--orange)}.kpi-value.c-green{color:var(--green)}
+.kpi-sub{font-size:11px;color:var(--text3);margin-top:6px}
+.kpi-sub .up{color:var(--red)}.kpi-sub .dn{color:var(--green)}
+.kpi-ghost{position:absolute;right:-6px;bottom:-8px;font-family:var(--font-d);font-size:60px;font-weight:800;opacity:.04;line-height:1;pointer-events:none;user-select:none}
 
 /* ── CHARTS ── */
-.charts-row{display:grid;grid-template-columns:1fr 1fr 1.2fr;gap:14px;margin-bottom:22px}
-.chart-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:18px 20px}
-.chart-title{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between}
-.bar-chart{display:flex;flex-direction:column;gap:8px}
-.bar-row{display:flex;align-items:center;gap:10px}
-.bar-label{font-size:11px;color:var(--text2);width:82px;text-align:right;flex-shrink:0}
-.bar-track{flex:1;background:var(--bg3);border-radius:4px;height:20px;position:relative;overflow:hidden}
-.bar-fill{height:100%;border-radius:4px;display:flex;align-items:center;padding-right:8px;justify-content:flex-end;font-size:10px;font-family:var(--font-mono);font-weight:500;color:#fff;transition:width 1s cubic-bezier(.4,0,.2,1)}
-.bar-num{font-size:11px;color:var(--text2);font-family:var(--font-mono);width:24px;flex-shrink:0;text-align:right}
-.donut-wrap{display:flex;align-items:center;gap:20px}
-.donut{width:110px;height:110px;flex-shrink:0}
-.donut-legend{display:flex;flex-direction:column;gap:7px}
-.legend-row{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text2)}
-.legend-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
-.legend-val{margin-left:auto;font-family:var(--font-mono);font-size:11px;color:var(--text2)}
-
-/* ── TABLE ── */
-.table-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;overflow:hidden}
-.table-header{padding:14px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
-.table-title{font-size:13px;font-weight:600}
-.filter-pills{display:flex;gap:6px}
-.pill{padding:3px 10px;border-radius:20px;font-size:11px;cursor:pointer;border:1px solid var(--border);color:var(--text2);transition:all .15s;font-weight:500;background:transparent;font-family:var(--font-body)}
-.pill:hover,.pill.active{background:var(--accent);border-color:var(--accent);color:#fff}
-table{width:100%;border-collapse:collapse}
-th{padding:10px 16px;text-align:left;font-size:10px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid var(--border);background:var(--bg3);white-space:nowrap}
-td{padding:12px 16px;border-bottom:1px solid var(--border);font-size:13px;vertical-align:middle}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:rgba(26,30,40,.7)}
-.sev-badge{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:5px;font-size:10px;font-weight:700;font-family:var(--font-mono);text-transform:uppercase;letter-spacing:.5px}
-.sev-critical{background:#2d0f0f;color:var(--red);border:1px solid #5a1a1a}
-.sev-high{background:#2d1f0a;color:var(--orange);border:1px solid #5a3a14}
-.sev-medium{background:#0d1f2d;color:var(--blue);border:1px solid #1a3a5a}
-.sev-low{background:#0d2018;color:var(--green);border:1px solid #1a3828}
-.cat-tag{display:inline-block;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;background:var(--bg4);color:var(--text2);border:1px solid var(--border2);font-family:var(--font-mono)}
-.status-dot{width:6px;height:6px;border-radius:50%;display:inline-block;margin-right:6px}
-.r-avatar{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0;color:#fff}
-.action-btn{background:transparent;border:1px solid var(--border);border-radius:6px;padding:3px 8px;font-size:10px;cursor:pointer;color:var(--text3);font-family:var(--font-mono);transition:all .15s}
-.action-btn:hover{background:var(--bg3);color:var(--text)}
-.action-btn.resolve{color:var(--green);border-color:#1a3828}.action-btn.resolve:hover{background:#0d2018}
-.action-btn.delete{color:var(--red);border-color:#3d1515}.action-btn.delete:hover{background:#2d0f0f}
+.charts-row{display:grid;grid-template-columns:1fr 1fr 1.2fr;gap:12px;margin-bottom:16px}
+.bar-chart-list{display:flex;flex-direction:column;gap:9px}
+.bc-row{display:flex;align-items:center;gap:8px}
+.bc-label{font-size:11px;color:var(--text2);width:84px;text-align:right;flex-shrink:0}
+.bc-track{flex:1;background:var(--bg4);border-radius:3px;height:16px;overflow:hidden}
+.bc-fill{height:100%;border-radius:3px;display:flex;align-items:center;justify-content:flex-end;padding-right:6px;font-size:9px;font-family:var(--font-m);color:rgba(255,255,255,.8);font-weight:500;transition:width 1s cubic-bezier(.4,0,.2,1)}
+.bc-num{font-size:10px;color:var(--text3);font-family:var(--font-m);width:18px;text-align:right;flex-shrink:0}
+.donut-wrap{display:flex;align-items:center;gap:16px}
+.donut{width:100px;height:100px;flex-shrink:0}
+.donut-legend{display:flex;flex-direction:column;gap:7px;flex:1}
+.dl-row{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--text2)}
+.dl-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.dl-val{margin-left:auto;font-family:var(--font-m);font-size:11px;color:var(--text3)}
 
 /* ── AI STATUS BAR ── */
-.ai-status-bar{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:10px 14px;display:flex;align-items:center;gap:12px;margin-bottom:14px;font-size:12px}
-.ai-status-bar.hidden{display:none}
-.pulse{width:8px;height:8px;border-radius:50%;background:var(--green);flex-shrink:0;animation:pulse 1.5s infinite}
-@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(46,204,138,.4)}50%{opacity:.8;box-shadow:0 0 0 6px rgba(46,204,138,0)}}
-.prog-bar{flex:1;background:var(--bg4);border-radius:4px;height:4px;overflow:hidden}
-.prog-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--teal));border-radius:4px;width:0%;transition:width .35s ease}
-.ai-status-text{color:var(--text2);flex:1}
+.ai-bar{background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);border-radius:var(--r);padding:10px 14px;display:none;align-items:center;gap:12px;margin-bottom:14px;font-size:12px}
+.ai-bar.show{display:flex}
+.ai-pulse{width:7px;height:7px;border-radius:50%;background:var(--accent2);flex-shrink:0;animation:aipulse 1.2s infinite}
+@keyframes aipulse{0%,100%{opacity:1;box-shadow:0 0 0 0 rgba(139,92,246,.5)}50%{opacity:.7;box-shadow:0 0 0 5px rgba(139,92,246,0)}}
+.ai-text{color:var(--text2);flex:1;font-size:12px}
+.ai-prog-track{width:160px;background:var(--bg4);border-radius:4px;height:3px;overflow:hidden;flex-shrink:0}
+.ai-prog-fill{height:100%;background:linear-gradient(90deg,var(--accent),var(--teal));border-radius:4px;transition:width .35s ease}
+.ai-counter{font-family:var(--font-m);color:var(--text3);font-size:11px;flex-shrink:0;min-width:40px;text-align:right}
+
+/* ── TABLE ── */
+.tbl-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+.tbl-toolbar{padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px;flex-wrap:wrap;gap:8px}
+.tbl-title{font-size:13px;font-weight:600}
+.pills{display:flex;gap:4px;flex-wrap:wrap}
+.pill{padding:3px 10px;border-radius:20px;font-size:11px;cursor:pointer;border:1px solid var(--border);color:var(--text3);transition:all .12s;font-weight:500;background:transparent;font-family:var(--font-b)}
+.pill:hover{border-color:var(--border2);color:var(--text2)}
+.pill.active{background:var(--accent);border-color:var(--accent);color:#fff}
+table{width:100%;border-collapse:collapse}
+th{padding:9px 14px;text-align:left;font-size:10px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;border-bottom:1px solid var(--border);background:var(--bg3);white-space:nowrap}
+td{padding:11px 14px;border-bottom:1px solid rgba(39,39,42,.6);font-size:13px;vertical-align:middle}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:rgba(24,24,27,.6)}
+.sev{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:600;font-family:var(--font-m);text-transform:uppercase;letter-spacing:.4px}
+.sev-critical{background:var(--redbg);color:var(--red);border:1px solid rgba(239,68,68,.2)}
+.sev-high{background:var(--orangebg);color:var(--orange);border:1px solid rgba(249,115,22,.2)}
+.sev-medium{background:var(--bluebg);color:var(--blue);border:1px solid rgba(59,130,246,.2)}
+.sev-low{background:var(--greenbg);color:var(--green);border:1px solid rgba(34,197,94,.2)}
+.cat{display:inline-block;padding:2px 7px;border-radius:4px;font-size:10px;font-weight:500;background:var(--bg4);color:var(--text3);border:1px solid var(--border2);font-family:var(--font-m)}
+.rdot{width:5px;height:5px;border-radius:50%;display:inline-block;margin-right:5px;vertical-align:middle}
+.rav{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;flex-shrink:0;color:#fff}
+.act-btn{background:transparent;border:1px solid var(--border);border-radius:4px;padding:3px 7px;font-size:10px;cursor:pointer;color:var(--text3);font-family:var(--font-m);transition:all .12s}
+.act-btn:hover{background:var(--bg4);color:var(--text2)}
+.act-btn.ok:hover{background:var(--greenbg);color:var(--green);border-color:rgba(34,197,94,.3)}
+.act-btn.del:hover{background:var(--redbg);color:var(--red);border-color:rgba(239,68,68,.3)}
 
 /* ── INGEST ── */
-.ingest-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin-bottom:14px}
-.ingest-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:22px;display:flex;flex-direction:column;gap:14px;transition:border-color .2s}
-.ingest-card:hover{border-color:var(--border2)}
-.ingest-icon{font-size:28px}
-.ingest-title{font-family:var(--font-display);font-size:15px;font-weight:700}
-.ingest-desc{font-size:12px;color:var(--text2);line-height:1.6}
-.ingest-meta{font-size:11px;color:var(--text3);font-family:var(--font-mono);padding:8px 10px;background:var(--bg3);border-radius:6px;border:1px solid var(--border);line-height:1.7}
-.manual-form{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:22px;margin-top:14px}
-.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.ingest-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:16px}
+.ic{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:20px;display:flex;flex-direction:column;gap:12px;transition:border-color .15s}
+.ic:hover{border-color:var(--border2)}
+.ic-icon{font-size:22px}
+.ic-title{font-family:var(--font-d);font-size:14px;font-weight:700}
+.ic-desc{font-size:12px;color:var(--text3);line-height:1.65}
+.ic-meta{font-size:10px;color:var(--text3);font-family:var(--font-m);padding:7px 9px;background:var(--bg3);border-radius:var(--r-sm);border:1px solid var(--border);line-height:1.7}
+.form-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:20px;margin-top:14px}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .form-full{grid-column:span 2}
-.form-group{display:flex;flex-direction:column;gap:5px}
-label{font-size:11px;color:var(--text2);font-weight:600;text-transform:uppercase;letter-spacing:.5px}
-input,textarea,select{background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:9px 12px;color:var(--text);font-family:var(--font-body);font-size:13px;outline:none;transition:border-color .15s;width:100%}
-input:focus,textarea:focus,select:focus{border-color:var(--accent)}
+.fg{display:flex;flex-direction:column;gap:4px}
+.fg label{font-size:10px;color:var(--text3);font-weight:600;text-transform:uppercase;letter-spacing:.6px}
+input,textarea,select{background:var(--bg3);border:1px solid var(--border);border-radius:var(--r-sm);padding:8px 11px;color:var(--text);font-family:var(--font-b);font-size:13px;outline:none;transition:border-color .12s;width:100%}
+input::placeholder,textarea::placeholder{color:var(--text3)}
+input:focus,textarea:focus,select:focus{border-color:var(--accent);background:var(--bg2)}
 select option{background:var(--bg3)}
-textarea{resize:vertical;min-height:80px}
+textarea{resize:vertical;min-height:76px}
 
 /* ── ANALYSIS ── */
-.analysis-top{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:14px;display:flex;gap:32px;align-items:flex-start}
-.analysis-summary{flex:1}
-.analysis-summary h2{font-family:var(--font-display);font-size:20px;font-weight:700;margin-bottom:8px}
-.analysis-summary p{font-size:13px;color:var(--text2);line-height:1.7}
-.health-ring{flex-shrink:0;text-align:center}
-.health-score{font-family:var(--font-display);font-size:48px;font-weight:800;color:var(--green);line-height:1}
-.health-label{font-size:11px;color:var(--text3);margin-top:4px;text-transform:uppercase;letter-spacing:.8px}
-.analysis-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
-.analysis-card{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:20px;margin-bottom:14px}
-.analysis-card h3{font-size:12px;font-weight:600;color:var(--text2);text-transform:uppercase;letter-spacing:.6px;margin-bottom:14px}
-.pattern-item{padding:12px 14px;background:var(--bg3);border-radius:8px;margin-bottom:8px;border-left:3px solid var(--accent)}
-.pattern-item:last-child{margin-bottom:0}
-.pattern-title{font-size:13px;font-weight:600;margin-bottom:4px}
-.pattern-sub{font-size:11px;color:var(--text2);margin-bottom:4px}
-.pattern-action{font-size:11px;color:var(--teal)}
-.reco-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
-.reco-card{padding:14px;background:var(--bg3);border-radius:8px;border:1px solid var(--border)}
-.reco-prio{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;font-family:var(--font-mono)}
-.reco-action{font-size:12px;font-weight:600;margin-bottom:6px}
-.reco-rationale{font-size:11px;color:var(--text2);line-height:1.5}
-
-/* ── PATTERNS ── */
-.psub{display:none}
-.psub.active{display:block;animation:fadeUp .2s ease both}
-.vel-bar-wrap{display:flex;align-items:flex-end;gap:4px;height:120px;padding:0 8px}
-.vel-bar-col{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1}
-.vel-bar-fill{width:100%;border-radius:4px 4px 0 0;transition:height .8s cubic-bezier(.4,0,.2,1)}
-.vel-bar-label{font-size:9px;color:var(--text3);font-family:var(--font-mono);text-align:center}
-.vel-bar-val{font-size:10px;font-family:var(--font-mono);font-weight:600}
-.comp-bar-wrap{display:flex;align-items:flex-end;gap:8px;height:130px;padding:0 8px}
-.comp-bar-col{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1}
-.comp-stacked{width:100%;display:flex;flex-direction:column;justify-content:flex-end;gap:1px;border-radius:4px 4px 0 0;overflow:hidden}
+.analysis-hero{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:22px;margin-bottom:14px;display:grid;grid-template-columns:1fr auto;gap:24px;align-items:start}
+.hero-title{font-family:var(--font-d);font-size:18px;font-weight:800;margin-bottom:6px}
+.hero-text{font-size:13px;color:var(--text2);line-height:1.7;max-width:600px}
+.hero-metrics{display:flex;gap:20px;margin-top:14px;flex-wrap:wrap}
+.hm{text-align:center}
+.hm-val{font-family:var(--font-d);font-size:26px;font-weight:800;line-height:1}
+.hm-lbl{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.7px;margin-top:2px}
+.health-box{text-align:center;background:var(--bg3);border-radius:var(--r);padding:16px 20px;min-width:120px}
+.health-num{font-family:var(--font-d);font-size:44px;font-weight:800;color:var(--green);line-height:1}
+.health-lbl{font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;margin-top:4px}
+.health-subs{margin-top:10px;display:flex;flex-direction:column;gap:4px}
+.hs-row{display:flex;justify-content:space-between;gap:16px;font-size:11px;color:var(--text3)}
+.analysis-2col{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.a-card{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:16px}
+.a-card h3{font-size:10px;font-weight:600;color:var(--text3);text-transform:uppercase;letter-spacing:.8px;margin-bottom:12px}
+.pat-item{padding:10px 12px;background:var(--bg3);border-radius:var(--r-sm);margin-bottom:7px;border-left:2px solid var(--accent)}
+.pat-item:last-child{margin-bottom:0}
+.pat-title{font-size:12px;font-weight:600;margin-bottom:3px}
+.pat-sub{font-size:11px;color:var(--text3);margin-bottom:4px}
+.pat-action{font-size:11px;color:var(--teal)}
+.reco-3col{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.reco{padding:14px;background:var(--bg3);border-radius:var(--r-sm);border:1px solid var(--border)}
+.reco-prio{font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.9px;margin-bottom:7px;font-family:var(--font-m)}
+.reco-action{font-size:12px;font-weight:600;margin-bottom:5px}
+.reco-why{font-size:11px;color:var(--text3);line-height:1.55}
+.ai-result-banner{background:rgba(124,58,237,.08);border:1px solid rgba(124,58,237,.2);border-radius:var(--r);padding:12px 16px;margin-bottom:14px;font-size:13px;color:var(--text2);line-height:1.65;display:none}
+.ai-result-banner.show{display:block}
 
 /* ── DOCUMENT ── */
-.doc-toolbar{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:16px 20px;display:flex;align-items:center;gap:12px;margin-bottom:14px;flex-wrap:wrap}
-.doc-body{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:32px 40px;font-family:var(--font-mono);font-size:12.5px;line-height:1.8;color:var(--text);max-height:520px;overflow-y:auto}
-.md-h1{font-family:var(--font-display);font-size:20px;font-weight:800;color:var(--text);margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:10px;margin-top:4px}
-.md-h2{font-family:var(--font-display);font-size:15px;font-weight:700;color:var(--accent2);margin-top:22px;margin-bottom:8px}
-.md-h3{font-size:13px;font-weight:700;color:var(--text);margin-top:12px;margin-bottom:5px}
-.md-p{font-size:13px;color:var(--text2);margin-bottom:10px;font-family:var(--font-body);line-height:1.7}
+.doc-header{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:14px 18px;display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.doc-body{background:var(--bg2);border:1px solid var(--border);border-radius:var(--r);padding:28px 36px;font-family:var(--font-m);font-size:12.5px;line-height:1.8;color:var(--text);max-height:520px;overflow-y:auto}
+.md-h1{font-family:var(--font-d);font-size:20px;font-weight:800;margin-bottom:8px;border-bottom:1px solid var(--border);padding-bottom:10px}
+.md-h2{font-family:var(--font-d);font-size:14px;font-weight:700;color:var(--accent2);margin-top:20px;margin-bottom:7px}
+.md-h3{font-size:13px;font-weight:600;margin-top:12px;margin-bottom:5px}
+.md-p{font-size:12.5px;color:var(--text2);margin-bottom:9px;font-family:var(--font-b);line-height:1.72}
 .md-table{width:100%;border-collapse:collapse;margin:10px 0;font-size:12px}
-.md-table th{background:var(--bg4);padding:7px 12px;text-align:left;color:var(--text2);border:1px solid var(--border2);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
-.md-table td{padding:7px 12px;border:1px solid var(--border);color:var(--text)}
-.md-table tr:nth-child(even) td{background:rgba(26,30,40,.5)}
-.md-ul{margin:6px 0 10px 18px;color:var(--text2);font-family:var(--font-body);font-size:13px}
+.md-table th{background:var(--bg4);padding:7px 11px;text-align:left;color:var(--text2);border:1px solid var(--border2);font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.md-table td{padding:7px 11px;border:1px solid var(--border);color:var(--text)}
+.md-table tr:nth-child(even) td{background:rgba(24,24,27,.5)}
+.md-ul{margin:5px 0 9px 16px;color:var(--text2);font-family:var(--font-b);font-size:12.5px}
 .md-ul li{margin-bottom:4px;line-height:1.6}
-.md-badge{display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;font-family:var(--font-mono)}
-.md-badge.c{background:#2d0f0f;color:var(--red);border:1px solid #5a1a1a}
-.md-badge.h{background:#2d1f0a;color:var(--orange);border:1px solid #5a3a14}
-.md-badge.m{background:#0d1f2d;color:var(--blue);border:1px solid #1a3a5a}
-.md-badge.l{background:#0d2018;color:var(--green);border:1px solid #1a3828}
-code{background:var(--bg4);padding:1px 5px;border-radius:4px;font-family:var(--font-mono);font-size:11px;color:var(--teal);border:1px solid var(--border)}
+.mdb{display:inline-block;padding:1px 6px;border-radius:3px;font-size:10px;font-weight:600;font-family:var(--font-m)}
+.mdb.c{background:var(--redbg);color:var(--red)}.mdb.h{background:var(--orangebg);color:var(--orange)}.mdb.m{background:var(--bluebg);color:var(--blue)}.mdb.l{background:var(--greenbg);color:var(--green)}
+code{background:var(--bg4);padding:1px 5px;border-radius:3px;font-family:var(--font-m);font-size:11px;color:var(--teal)}
 
 /* ── MODAL ── */
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
-.modal-overlay.hidden{display:none}
-.modal{background:var(--bg2);border:1px solid var(--border2);border-radius:14px;padding:28px;width:540px;max-width:94vw;max-height:88vh;overflow-y:auto;animation:fadeUp .2s ease}
-.modal-title{font-family:var(--font-display);font-size:17px;font-weight:700;margin-bottom:18px;display:flex;align-items:center;justify-content:space-between}
-.modal-close{background:none;border:none;color:var(--text3);cursor:pointer;font-size:18px;padding:2px 6px;border-radius:6px}
-.modal-close:hover{background:var(--bg3);color:var(--text)}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
+.overlay.hidden{display:none}
+.modal{background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r-lg);padding:24px;width:520px;max-width:92vw;max-height:88vh;overflow-y:auto;animation:fadeUp .16s ease}
+.modal-hd{font-family:var(--font-d);font-size:15px;font-weight:700;margin-bottom:16px;display:flex;align-items:center;justify-content:space-between}
+.modal-x{background:none;border:none;color:var(--text3);cursor:pointer;font-size:16px;padding:2px 6px;border-radius:4px;transition:color .12s}
+.modal-x:hover{color:var(--text);background:var(--bg3)}
 
 /* ── TOAST ── */
-.toast{position:fixed;bottom:24px;right:24px;background:var(--bg2);border:1px solid var(--border2);border-radius:10px;padding:12px 18px;font-size:13px;color:var(--text);box-shadow:0 8px 32px rgba(0,0,0,.5);z-index:999;transform:translateY(60px);opacity:0;transition:all .28s cubic-bezier(.4,0,.2,1);max-width:360px}
+.toast{position:fixed;bottom:20px;right:20px;background:var(--bg2);border:1px solid var(--border2);border-radius:var(--r);padding:11px 16px;font-size:13px;color:var(--text);box-shadow:0 8px 24px rgba(0,0,0,.6);z-index:999;transform:translateY(56px);opacity:0;transition:all .24s cubic-bezier(.4,0,.2,1);max-width:340px;display:flex;align-items:center;gap:8px}
 .toast.show{transform:translateY(0);opacity:1}
 
-/* ── UTILS ── */
-.hidden{display:none!important}
-.text-red{color:var(--red)}.text-orange{color:var(--orange)}.text-green{color:var(--green)}.text-blue{color:var(--blue)}.text-accent{color:var(--accent)}
-.empty-state{text-align:center;padding:48px;color:var(--text3);font-size:13px}
-.empty-state big{display:block;font-size:32px;margin-bottom:12px}
+/* ── PATTERNS / INSIGHTS ── */
+.ins-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px}
+.ins-subnav{display:flex;gap:4px;margin-bottom:18px;border-bottom:1px solid var(--border);padding-bottom:12px;align-items:center}
+.psub{display:none}.psub.active{display:block;animation:fadeUp .18s ease}
+.vel-bars{display:flex;align-items:flex-end;gap:6px;height:120px;padding:0 4px}
+.vel-col{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1}
+.vel-fill{width:100%;border-radius:4px 4px 0 0;transition:height .8s cubic-bezier(.4,0,.2,1)}
+.vel-lbl{font-size:9px;color:var(--text3);font-family:var(--font-m);text-align:center}
+.vel-num{font-size:10px;font-family:var(--font-m);font-weight:600}
+.comp-bars{display:flex;align-items:flex-end;gap:8px;height:130px;padding:0 4px}
+.comp-col{display:flex;flex-direction:column;align-items:center;gap:4px;flex:1}
+.comp-stk{width:100%;display:flex;flex-direction:column;justify-content:flex-end;border-radius:3px 3px 0 0;overflow:hidden}
+.vel-bar{height:5px;border-radius:3px;background:var(--bg4);overflow:hidden;width:50px;display:inline-block;vertical-align:middle;margin-right:4px}
+.vel-bar-fill{height:100%;border-radius:3px}
 
+/* ── EMPTY STATE ── */
+.empty{text-align:center;padding:44px 20px;color:var(--text3)}
+.empty-icon{font-size:28px;margin-bottom:10px;opacity:.5}
+.empty-title{font-size:14px;font-weight:600;color:var(--text2);margin-bottom:4px}
+.empty-sub{font-size:12px}
+
+/* ── AI CONFIG BANNER ── */
+.ai-config-banner{background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.2);border-radius:var(--r);padding:11px 16px;margin-bottom:14px;display:flex;align-items:center;gap:10px;font-size:12px;color:var(--text2)}
+.ai-config-banner.ok{background:rgba(34,197,94,.06);border-color:rgba(34,197,94,.2)}
+.hidden{display:none!important}
 </style>
 </head>
 <body>
 
-<!-- ── TOAST ── -->
+<!-- TOAST -->
 <div id="toast" class="toast"></div>
 
-<!-- ── MODAL ── -->
-<div id="modal-overlay" class="modal-overlay hidden">
+<!-- MODAL -->
+<div id="overlay" class="overlay hidden">
   <div id="modal" class="modal"></div>
 </div>
 
-<!-- ── SIDEBAR ── -->
+<!-- SIDEBAR -->
 <div class="sidebar">
   <div class="logo">
-    <div class="logo-icon">⚡</div>
+    <div class="logo-mark">⚡</div>
     <div>
-      <div>IssueAI</div>
-      <span>Project Intelligence</span>
+      <div class="logo-name">IssueAI</div>
+      <div class="logo-tag">Project Intelligence</div>
     </div>
   </div>
   <nav class="nav">
+    <div class="nav-section">Workspace</div>
     <div class="nav-item" data-tab="dashboard"><span class="nav-icon">⊞</span>Dashboard</div>
-    <div class="nav-item active" data-tab="issues"><span class="nav-icon">◈</span>Issues<span class="nav-badge" id="nav-badge-issues">—</span></div>
+    <div class="nav-item active" data-tab="issues"><span class="nav-icon">◈</span>Issues<span class="nav-badge" id="nav-issues-badge">—</span></div>
     <div class="nav-item" data-tab="ingest"><span class="nav-icon">↓</span>Ingest Data</div>
+    <div class="nav-section">Intelligence</div>
     <div class="nav-item" data-tab="analysis"><span class="nav-icon">✦</span>AI Analysis</div>
-    <div class="nav-item" data-tab="patterns"><span class="nav-icon">◉</span>Patterns</div>
-    <div class="nav-item" data-tab="document"><span class="nav-icon">≡</span>Documents<span class="nav-badge green">1</span></div>
+    <div class="nav-item" data-tab="patterns"><span class="nav-icon">◉</span>Insights</div>
+    <div class="nav-item" data-tab="document"><span class="nav-icon">≡</span>Report<span class="nav-badge ok" id="nav-doc-badge" style="display:none">New</span></div>
   </nav>
   <div class="sidebar-footer">
-    <div class="avatar" id="user-avatar">RK</div>
+    <div class="av" id="user-av">RK</div>
     <div>
-      <div class="user-name" id="user-name">Ravi Kumar</div>
-      <div class="user-role">Engineering Lead</div>
+      <div class="av-name" id="user-name">Team Lead</div>
+      <div class="av-role">Engineering</div>
     </div>
+    <div class="status-online"></div>
   </div>
 </div>
 
-<!-- ── MAIN ── -->
+<!-- MAIN -->
 <div class="main">
   <div class="topbar">
-    <div class="page-title" id="page-title">Issues</div>
-    <div class="topbar-actions">
+    <div>
+      <div class="page-title" id="page-title">Issues</div>
+    </div>
+    <div class="topbar-right">
       <div class="search-wrap">
-        <input class="search-bar" id="global-search" placeholder="Search issues, projects…"/>
+        <span class="search-icon">⌕</span>
+        <input class="search-bar" id="global-search" placeholder="Search issues…"/>
       </div>
-      <button class="btn btn-secondary" data-go="ingest">↓ Ingest</button>
-      <button class="btn btn-primary" id="btn-add-issue">+ Add Issue</button>
+      <button class="btn btn-secondary btn-sm" data-go="ingest">↓ Ingest</button>
+      <button class="btn btn-primary btn-sm" id="btn-add-issue">+ Add Issue</button>
     </div>
   </div>
 
   <div class="content">
     <div class="tab-panels">
 
-      <!-- ══════════════════ DASHBOARD ══════════════════ -->
-      <div id="tab-dashboard">
-        <!-- KPI row -->
-        <div class="kpi-grid" id="kpi-grid">
-          <div class="kpi-card red"><div class="kpi-label">Critical Issues</div><div class="kpi-value red" id="kpi-critical">—</div><div class="kpi-sub" id="kpi-critical-sub"> </div><div class="kpi-bg-num" id="kpi-critical-bg">—</div></div>
-          <div class="kpi-card orange"><div class="kpi-label">Open Issues</div><div class="kpi-value orange" id="kpi-open">—</div><div class="kpi-sub" id="kpi-open-sub"> </div><div class="kpi-bg-num" id="kpi-open-bg">—</div></div>
-          <div class="kpi-card green"><div class="kpi-label">Team Health</div><div class="kpi-value green" id="kpi-health">—</div><div class="kpi-sub"><b>/ 10</b> AI score</div><div class="kpi-bg-num" id="kpi-health-bg">—</div></div>
-          <div class="kpi-card accent"><div class="kpi-label">Resolved</div><div class="kpi-value accent" id="kpi-resolved">—</div><div class="kpi-sub" id="kpi-resolved-sub"> </div><div class="kpi-bg-num" id="kpi-resolved-bg">—</div></div>
+    <!-- ════════════ DASHBOARD ════════════ -->
+    <div id="tab-dashboard">
+      <div class="kpi-grid">
+        <div class="kpi kpi-red">
+          <div class="kpi-label">🔴 Critical</div>
+          <div class="kpi-value c-red" id="kpi-critical">—</div>
+          <div class="kpi-sub" id="kpi-critical-sub">open issues</div>
+          <div class="kpi-ghost" id="kpi-critical-bg">—</div>
         </div>
-
-        <!-- AI status bar -->
-        <div class="ai-status-bar hidden" id="ai-status">
-          <div class="pulse"></div>
-          <span class="ai-status-text" id="ai-status-text">Processing…</span>
-          <div class="prog-bar"><div class="prog-fill" id="prog-fill"></div></div>
-          <span style="font-family:var(--font-mono);font-size:11px;color:var(--text2)" id="ai-counter"></span>
+        <div class="kpi kpi-orange">
+          <div class="kpi-label">📂 Open Issues</div>
+          <div class="kpi-value c-orange" id="kpi-open">—</div>
+          <div class="kpi-sub" id="kpi-open-sub">across projects</div>
+          <div class="kpi-ghost" id="kpi-open-bg">—</div>
         </div>
+        <div class="kpi kpi-green">
+          <div class="kpi-label">💚 Team Health</div>
+          <div class="kpi-value c-green" id="kpi-health">—</div>
+          <div class="kpi-sub">/ 10 AI score</div>
+          <div class="kpi-ghost" id="kpi-health-bg">—</div>
+        </div>
+        <div class="kpi kpi-accent">
+          <div class="kpi-label">✓ Resolved</div>
+          <div class="kpi-value c-accent" id="kpi-resolved">—</div>
+          <div class="kpi-sub" id="kpi-resolved-sub">total closed</div>
+          <div class="kpi-ghost" id="kpi-resolved-bg">—</div>
+        </div>
+      </div>
 
-        <!-- Charts row -->
-        <div class="charts-row">
-          <div class="chart-card">
-            <div class="chart-title">By Category <span style="color:var(--text3);font-weight:400;font-size:10px">AI Classified</span></div>
-            <div class="bar-chart" id="cat-chart"></div>
-          </div>
-          <div class="chart-card">
-            <div class="chart-title">Severity Split</div>
+      <!-- AI status bar -->
+      <div class="ai-bar" id="ai-bar">
+        <div class="ai-pulse"></div>
+        <div class="ai-text" id="ai-text">Connecting to AI…</div>
+        <div class="ai-prog-track"><div class="ai-prog-fill" id="ai-prog" style="width:0%"></div></div>
+        <div class="ai-counter" id="ai-counter"></div>
+        <button class="btn btn-ghost btn-sm" id="ai-cancel">✕</button>
+      </div>
+
+      <!-- Charts -->
+      <div class="charts-row">
+        <div class="card">
+          <div class="card-header"><span class="card-title">By Category</span><span style="font-size:10px;color:var(--teal);background:rgba(20,184,166,.1);padding:2px 7px;border-radius:20px;border:1px solid rgba(20,184,166,.2)">AI Tagged</span></div>
+          <div class="card-body"><div class="bar-chart-list" id="cat-chart"></div></div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">Severity Split</span></div>
+          <div class="card-body">
             <div class="donut-wrap">
               <svg class="donut" id="donut-svg" viewBox="0 0 110 110"></svg>
               <div class="donut-legend" id="donut-legend"></div>
             </div>
           </div>
-          <div class="chart-card">
-            <div class="chart-title">Issues by Project</div>
-            <div class="bar-chart" id="proj-chart"></div>
-            <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
-              <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:0.6px;margin-bottom:8px">Quick actions</div>
-              <div style="display:flex;gap:8px;flex-wrap:wrap">
-                <button class="btn btn-secondary" style="font-size:11px;padding:5px 12px" id="btn-classify">🤖 Classify all</button>
-                <button class="btn btn-primary"   style="font-size:11px;padding:5px 12px" data-go="analysis">✦ Run Analysis</button>
-              </div>
+        </div>
+        <div class="card">
+          <div class="card-header"><span class="card-title">By Project</span></div>
+          <div class="card-body">
+            <div class="bar-chart-list" id="proj-chart" style="margin-bottom:14px"></div>
+            <div style="border-top:1px solid var(--border);padding-top:12px;display:flex;flex-direction:column;gap:7px">
+              <button class="btn btn-ai" style="width:100%;justify-content:center" id="btn-classify">⚡ Classify with AI</button>
+              <button class="btn btn-secondary" style="width:100%;justify-content:center" data-go="analysis">✦ Run Analysis</button>
             </div>
           </div>
         </div>
       </div>
 
-      <!-- ══════════════════ ISSUES ══════════════════ -->
-      <div id="tab-issues" class="active">
-        <div class="table-card">
-          <div class="table-header">
-            <div class="table-title">All Issues</div>
-            <div class="filter-pills" id="filter-pills">
-              <div class="pill active" data-filter="all">All</div>
-              <div class="pill" data-filter="open">Open</div>
-              <div class="pill" data-filter="critical">Critical</div>
-              <div class="pill" data-filter="resolved">Resolved</div>
+      <!-- AI config status -->
+      <div class="ai-config-banner hidden" id="ai-config-banner">
+        <span id="ai-config-icon">⚙</span>
+        <span id="ai-config-text">Checking AI configuration…</span>
+      </div>
+    </div>
+
+    <!-- ════════════ ISSUES ════════════ -->
+    <div id="tab-issues" class="active">
+      <div class="tbl-card">
+        <div class="tbl-toolbar">
+          <span class="tbl-title">All Issues</span>
+          <div class="pills" id="filter-pills">
+            <button class="pill active" data-filter="all">All</button>
+            <button class="pill" data-filter="open">Open</button>
+            <button class="pill" data-filter="critical">Critical</button>
+            <button class="pill" data-filter="resolved">Resolved</button>
+          </div>
+          <div class="pills" id="proj-pills"></div>
+          <div style="margin-left:auto;display:flex;gap:6px">
+            <button class="btn btn-ghost btn-sm" id="btn-export">⬇ CSV</button>
+            <button class="btn btn-primary btn-sm" id="btn-add-issue2">+ Add</button>
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead>
+              <tr>
+                <th style="width:36px">#</th>
+                <th>Title</th>
+                <th>Project</th>
+                <th>Reporter</th>
+                <th>Severity</th>
+                <th>Category</th>
+                <th>Root Cause</th>
+                <th>Status</th>
+                <th style="width:70px"></th>
+              </tr>
+            </thead>
+            <tbody id="issues-tbody">
+              <tr><td colspan="9" style="text-align:center;padding:32px;color:var(--text3)">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ════════════ INGEST ════════════ -->
+    <div id="tab-ingest">
+      <div class="ingest-grid">
+        <div class="ic">
+          <div class="ic-icon">💬</div>
+          <div class="ic-title">MS Teams</div>
+          <div class="ic-desc">Pull messages from a Teams channel via Microsoft Graph API. Uses mock data when credentials are not configured.</div>
+          <div class="ic-meta">Mode: mock · Set TEAMS_* env vars for live sync</div>
+          <button class="btn btn-primary btn-sm" id="btn-teams-ingest">↓ Ingest Mock Data</button>
+        </div>
+        <div class="ic">
+          <div class="ic-icon">📊</div>
+          <div class="ic-title">CSV Upload</div>
+          <div class="ic-desc">Upload any CSV. Columns auto-mapped: title, description, reporter, project, severity, status, category.</div>
+          <div class="ic-meta">Accepted: .csv · Max 10MB</div>
+          <div style="display:flex;gap:7px;flex-wrap:wrap">
+            <label class="btn btn-primary btn-sm" style="cursor:pointer">📂 Upload<input type="file" id="csv-upload" accept=".csv" style="display:none"/></label>
+            <a class="btn btn-ghost btn-sm" href="/api/issues/export-csv" download>⬇ Template</a>
+          </div>
+        </div>
+        <div class="ic">
+          <div class="ic-icon">⌨</div>
+          <div class="ic-title">Manual Entry</div>
+          <div class="ic-desc">Log a single issue directly. Useful for standup blockers or ad-hoc reports. Saves instantly to the database.</div>
+          <div class="ic-meta">Immediate · Source tagged as "manual"</div>
+          <button class="btn btn-secondary btn-sm" id="btn-open-form">+ Open Form ↓</button>
+        </div>
+      </div>
+
+      <div class="form-card" id="manual-form-section">
+        <div style="font-family:var(--font-d);font-size:14px;font-weight:700;margin-bottom:14px;color:var(--text)">Log a New Issue</div>
+        <form id="issue-form">
+          <div class="form-grid">
+            <div class="fg form-full"><label>Title *</label><input name="title" placeholder="e.g. Prod deployment rollback failed" required/></div>
+            <div class="fg form-full"><label>Description</label><textarea name="description" placeholder="Steps to reproduce, business impact, links to logs…"></textarea></div>
+            <div class="fg"><label>Reporter</label><input name="reporter" placeholder="Your name"/></div>
+            <div class="fg"><label>Project</label>
+              <select name="project"><option>Phoenix</option><option>Atlas</option><option>Horizon</option><option>General</option></select>
             </div>
-            <!-- project filter pills injected by JS -->
-            <div class="filter-pills" id="proj-pills" style="margin-left:8px"></div>
-            <div style="margin-left:auto;display:flex;gap:8px">
-              <button class="btn btn-secondary" style="font-size:11px;padding:5px 10px" id="btn-export">⬇ Export CSV</button>
-              <button class="btn btn-primary"   style="font-size:11px;padding:5px 10px" id="btn-add-issue2">+ Add</button>
+            <div class="fg"><label>Severity</label>
+              <select name="severity"><option value="low">Low</option><option value="medium" selected>Medium</option><option value="high">High</option><option value="critical">Critical</option></select>
+            </div>
+            <div class="fg"><label>Category</label>
+              <select name="category"><option value="">— auto-detect —</option><option>technical</option><option>process</option><option>security</option><option>quality</option><option>environment</option><option>other</option></select>
+            </div>
+            <div class="fg form-full"><label>Root Cause (optional)</label><input name="root_cause" placeholder="Your hypothesis on why this happened"/></div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:14px;align-items:center">
+            <button type="submit" class="btn btn-primary">Save Issue</button>
+            <button type="button" class="btn btn-ghost btn-sm" id="btn-form-reset">Clear</button>
+            <span id="form-status" style="font-size:12px;color:var(--text3)"></span>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- ════════════ ANALYSIS ════════════ -->
+    <div id="tab-analysis">
+      <!-- AI result banner -->
+      <div class="ai-result-banner" id="ai-result-banner"></div>
+
+      <div class="analysis-hero">
+        <div>
+          <div class="hero-title" id="analysis-title">AI Analysis</div>
+          <div class="hero-text" id="analysis-summary-text" style="color:var(--text3)">Click <strong style="color:var(--text)">Run Analysis</strong> to generate AI-powered insights from your current issue data. Requires OpenRouter API key.</div>
+          <div class="hero-metrics" id="analysis-metrics"></div>
+          <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+            <button class="btn btn-ai btn-lg" id="btn-run-analysis">✦ Run AI Analysis</button>
+            <button class="btn btn-secondary" data-go="document">≡ View Report</button>
+          </div>
+        </div>
+        <div class="health-box">
+          <div class="health-num" id="health-score">—</div>
+          <div class="health-lbl">Team Health</div>
+          <div class="health-subs" id="health-subs"></div>
+        </div>
+      </div>
+
+      <div class="analysis-2col hidden" id="analysis-grid">
+        <div class="a-card">
+          <h3>Issues by Category</h3>
+          <div id="analysis-cats"></div>
+        </div>
+        <div class="a-card">
+          <h3>Issues by Project</h3>
+          <div id="analysis-projs"></div>
+        </div>
+      </div>
+
+      <div class="a-card hidden" id="analysis-reco-card" style="margin-bottom:0">
+        <h3>Recommendations</h3>
+        <div class="reco-3col" id="reco-grid"></div>
+      </div>
+    </div>
+
+    <!-- ════════════ INSIGHTS / PATTERNS ════════════ -->
+    <div id="tab-patterns">
+      <div class="ins-subnav">
+        <button class="pill active" data-psub="velocity">Velocity Trend</button>
+        <button class="pill" data-psub="composition">Issue Composition</button>
+        <button class="pill" data-psub="table">Data Table</button>
+        <div style="margin-left:auto;display:flex;align-items:center;gap:8px">
+          <span style="font-size:11px;color:var(--text3)">Project:</span>
+          <select id="pattern-project-select" style="width:auto;padding:4px 8px;font-size:12px">
+            <option value="Phoenix">Phoenix</option>
+            <option value="Atlas">Atlas</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="psub-velocity" class="psub active">
+        <div class="card" style="margin-bottom:12px">
+          <div class="card-header"><span class="card-title">Velocity Score — Over Time</span></div>
+          <div class="card-body">
+            <div class="vel-bars" id="velocity-chart-wrap" style="height:120px"></div>
+            <div style="display:flex;gap:14px;margin-top:8px;font-size:10px;color:var(--text3)">
+              <span>● Green ≥ 7 healthy</span><span>● Yellow 4–6 watch</span><span>● Red &lt; 4 risk</span>
             </div>
           </div>
+        </div>
+        <div class="kpi-grid" id="pattern-kpis"></div>
+      </div>
+
+      <div id="psub-composition" class="psub">
+        <div class="card">
+          <div class="card-header"><span class="card-title">Issue Composition — Critical + High Over Time</span></div>
+          <div class="card-body">
+            <div class="comp-bars" id="composition-chart-wrap" style="height:130px"></div>
+            <div style="display:flex;gap:12px;margin-top:8px;font-size:10px;color:var(--text3)">
+              <span style="color:var(--red)">■ Critical</span>
+              <span style="color:var(--orange)">■ High</span>
+              <span style="color:var(--blue);opacity:.6">■ Med+Low</span>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div id="psub-table" class="psub">
+        <div class="tbl-card">
           <div style="overflow-x:auto">
             <table>
               <thead>
-                <tr>
-                  <th style="width:36px">#</th>
-                  <th>Issue Title</th>
-                  <th>Project</th>
-                  <th>Reporter</th>
-                  <th>Severity</th>
-                  <th>Category</th>
-                  <th>Root Cause (AI)</th>
-                  <th>Status</th>
-                  <th style="width:60px"></th>
-                </tr>
+                <tr><th>Period</th><th>Total</th><th>Critical</th><th>High</th><th>Med</th><th>Low</th><th>Resolved</th><th>Top Category</th><th>Velocity</th></tr>
               </thead>
-              <tbody id="issues-tbody">
-                <tr><td colspan="9" style="text-align:center;padding:40px;color:var(--text3)">Loading…</td></tr>
-              </tbody>
+              <tbody id="sprint-tbody"></tbody>
             </table>
           </div>
         </div>
       </div>
+    </div>
 
-      <!-- ══════════════════ INGEST ══════════════════ -->
-      <div id="tab-ingest">
-        <div class="ingest-grid">
-          <div class="ingest-card">
-            <div class="ingest-icon">💬</div>
-            <div class="ingest-title">MS Teams Channel</div>
-            <div class="ingest-desc">Pull messages from a Teams channel via Microsoft Graph API. In production, configure your TEAMS_TENANT_ID in .env — uses mock data automatically when not set.</div>
-            <div class="ingest-meta">Status: mock mode active<br/>Set TEAMS_* env vars to enable live sync</div>
-            <button class="btn btn-primary" id="btn-teams-ingest">↓ Ingest Mock Data</button>
-          </div>
-          <div class="ingest-card">
-            <div class="ingest-icon">📊</div>
-            <div class="ingest-title">CSV / Spreadsheet</div>
-            <div class="ingest-desc">Upload any CSV with columns: title, description, reporter, project, severity, status. Extra columns are safely ignored.</div>
-            <div class="ingest-meta">Accepted: .csv · Max 10 MB<br/>Download template to get started</div>
-            <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <label class="btn btn-primary" style="cursor:pointer">📂 Upload CSV<input type="file" id="csv-upload" accept=".csv" style="display:none"/></label>
-              <a class="btn btn-secondary" href="/api/issues/export-csv" download>⬇ Template</a>
-            </div>
-          </div>
-          <div class="ingest-card">
-            <div class="ingest-icon">⌨️</div>
-            <div class="ingest-title">Manual Entry</div>
-            <div class="ingest-desc">Quickly log a single issue — useful for standup blockers or ad-hoc reports not formally tracked yet.</div>
-            <div class="ingest-meta">Immediate · No setup required<br/>Source tagged as "manual"</div>
-            <button class="btn btn-secondary" id="btn-open-form">+ Open Form</button>
-          </div>
+    <!-- ════════════ DOCUMENT ════════════ -->
+    <div id="tab-document">
+      <div class="doc-header">
+        <div>
+          <div style="font-family:var(--font-d);font-weight:700;font-size:14px" id="doc-filename">issueai-report.md</div>
+          <div style="font-size:11px;color:var(--text3);margin-top:2px" id="doc-meta">Live data report</div>
         </div>
-
-        <!-- Manual form -->
-        <div class="manual-form" id="manual-form-section">
-          <div style="font-family:var(--font-display);font-size:15px;font-weight:700;margin-bottom:16px">Log a New Issue</div>
-          <form id="issue-form">
-            <div class="form-grid">
-              <div class="form-group form-full">
-                <label for="f-title">Issue Title *</label>
-                <input id="f-title" name="title" placeholder="e.g. Prod deployment rollback failed after hotfix" required/>
-              </div>
-              <div class="form-group form-full">
-                <label for="f-desc">Description</label>
-                <textarea id="f-desc" name="description" placeholder="Steps to reproduce, business impact, links to logs…"></textarea>
-              </div>
-              <div class="form-group">
-                <label for="f-reporter">Reporter</label>
-                <input id="f-reporter" name="reporter" placeholder="Your name"/>
-              </div>
-              <div class="form-group">
-                <label for="f-project">Project</label>
-                <select id="f-project" name="project">
-                  <option>Phoenix</option><option>Atlas</option><option>Horizon</option><option>General</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label for="f-severity">Severity</label>
-                <select id="f-severity" name="severity">
-                  <option value="low">Low</option>
-                  <option value="medium" selected>Medium</option>
-                  <option value="high">High</option>
-                  <option value="critical">Critical</option>
-                </select>
-              </div>
-              <div class="form-group">
-                <label for="f-category">Category</label>
-                <select id="f-category" name="category">
-                  <option value="">— select —</option>
-                  <option>technical</option><option>process</option><option>security</option>
-                  <option>quality</option><option>environment</option><option>other</option>
-                </select>
-              </div>
-              <div class="form-group form-full">
-                <label for="f-root">Root Cause (optional)</label>
-                <input id="f-root" name="root_cause" placeholder="Your hypothesis on why this happened"/>
-              </div>
-            </div>
-            <div style="display:flex;gap:10px;margin-top:16px;align-items:center">
-              <button type="submit" class="btn btn-primary">Save Issue</button>
-              <button type="button" class="btn btn-secondary" id="btn-form-reset">Clear</button>
-              <span id="form-status" style="font-size:12px;color:var(--text3)"></span>
-            </div>
-          </form>
+        <div style="margin-left:auto;display:flex;gap:7px;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" id="btn-copy-report">📋 Copy</button>
+          <button class="btn btn-ai btn-sm" id="btn-ai-report">⚡ AI Report</button>
+          <a class="btn btn-secondary btn-sm" id="btn-download-report" href="/api/report" download>⬇ Download .md</a>
         </div>
       </div>
-
-      <!-- ══════════════════ ANALYSIS ══════════════════ -->
-      <div id="tab-analysis">
-        <div class="analysis-top">
-          <div class="analysis-summary">
-            <h2 id="analysis-title">AI Analysis</h2>
-            <p id="analysis-summary-text" style="color:var(--text2)">Click <strong>Run Analysis</strong> to generate insights from your current issue data. The analysis looks at severity distribution, recurring categories, and team health score.</p>
-            <div style="display:flex;gap:24px;margin-top:16px;flex-wrap:wrap" id="analysis-metrics"></div>
-            <div style="display:flex;gap:8px;margin-top:16px">
-              <button class="btn btn-primary" id="btn-run-analysis">✦ Run Analysis</button>
-              <button class="btn btn-secondary" data-go="document">📄 Generate Report</button>
-            </div>
-          </div>
-          <div class="health-ring">
-            <div class="health-score" id="health-score">—</div>
-            <div class="health-label">Team Health</div>
-          </div>
-        </div>
-
-        <div class="analysis-grid" id="analysis-grid" style="display:none">
-          <div class="analysis-card">
-            <h3>Issues by Category</h3>
-            <div id="analysis-cats"></div>
-          </div>
-          <div class="analysis-card">
-            <h3>Open Issues by Project</h3>
-            <div id="analysis-projs"></div>
-          </div>
-        </div>
-
-        <div class="analysis-card" id="analysis-reco-card" style="display:none">
-          <h3>Recommendations</h3>
-          <div class="reco-grid" id="reco-grid"></div>
+      <div class="doc-body" id="doc-body">
+        <div class="empty">
+          <div class="empty-icon">≡</div>
+          <div class="empty-title">No report yet</div>
+          <div class="empty-sub">Click <strong>⬇ Download .md</strong> for a basic report, or <strong>⚡ AI Report</strong> for a full AI-written document.</div>
         </div>
       </div>
+    </div>
 
-      <!-- ══════════════════ PATTERNS ══════════════════ -->
-      <div id="tab-patterns">
-        <div style="display:flex;gap:6px;margin-bottom:18px;border-bottom:1px solid var(--border);padding-bottom:14px">
-          <button class="pill active" data-psub="velocity">Velocity Trend</button>
-          <button class="pill" data-psub="composition">Issue Composition</button>
-          <button class="pill" data-psub="table">Sprint Table</button>
-          <div style="margin-left:auto">
-            <select id="pattern-project-select" style="background:var(--bg3);border:1px solid var(--border);border-radius:8px;padding:5px 10px;color:var(--text);font-size:12px;outline:none">
-              <option value="Phoenix">Phoenix</option>
-              <option value="Atlas">Atlas</option>
-            </select>
-          </div>
-        </div>
-
-        <!-- Velocity sub-panel -->
-        <div id="psub-velocity" class="psub active">
-          <div class="chart-card" style="margin-bottom:14px">
-            <div class="chart-title">Velocity Score — Sprint over Sprint</div>
-            <div id="velocity-chart-wrap" style="position:relative;height:140px"></div>
-            <div style="display:flex;gap:16px;margin-top:8px;font-size:10px;color:var(--text3)">
-              <span>● Green ≥ 7 (healthy)</span><span>● Yellow 4–6 (watch)</span><span>● Red &lt; 4 (at risk)</span>
-            </div>
-          </div>
-          <div class="kpi-grid" id="pattern-kpis"></div>
-        </div>
-
-        <!-- Composition sub-panel -->
-        <div id="psub-composition" class="psub hidden">
-          <div class="chart-card">
-            <div class="chart-title">Issue Composition — Critical + High per Sprint</div>
-            <div id="composition-chart-wrap" style="position:relative;height:160px"></div>
-          </div>
-        </div>
-
-        <!-- Sprint Table sub-panel -->
-        <div id="psub-table" class="psub hidden">
-          <div class="table-card">
-            <div style="overflow-x:auto">
-              <table>
-                <thead>
-                  <tr><th>Sprint</th><th>Total</th><th>Critical</th><th>High</th><th>Medium</th><th>Low</th><th>Resolved</th><th>Top Category</th><th>Velocity</th></tr>
-                </thead>
-                <tbody id="sprint-tbody"></tbody>
-              </table>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- ══════════════════ DOCUMENT ══════════════════ -->
-      <div id="tab-document">
-        <div class="doc-toolbar">
-          <span style="font-family:var(--font-display);font-weight:700" id="doc-filename">issueai-report.md</span>
-          <span style="font-family:var(--font-mono);font-size:11px;color:var(--text3)" id="doc-meta">Generated from live data</span>
-          <div style="margin-left:auto;display:flex;gap:8px">
-            <button class="btn btn-secondary" style="font-size:11px" id="btn-copy-report">📋 Copy</button>
-            <a class="btn btn-primary" style="font-size:11px;text-decoration:none" id="btn-download-report" href="/api/report" download>⬇ Download .md</a>
-          </div>
-        </div>
-        <div class="doc-body" id="doc-body">
-          <div style="color:var(--text3);text-align:center;padding:40px">
-            Click <strong style="color:var(--text)">⬇ Download .md</strong> to generate and download the live report,<br/>
-            or click <strong style="color:var(--text)">📋 Copy</strong> to copy the Markdown to your clipboard.
-          </div>
-        </div>
-      </div>
-
-    </div><!-- /tab-panels -->
+    </div>
   </div>
 </div>
 
 <script>
-/* ── IssueAI Frontend ──────────────────────────────────────────────────── */
 'use strict';
+// ── State ──────────────────────────────────────────────────────────────────
+const S = { issues:[], stats:{}, sprints:[], filter:{sev:'all',status:'all',project:'all'}, search:'', tab:'issues', aiConfigured:false };
 
-// ── State ────────────────────────────────────────────────────────────────────
-const state = {
-  issues: [],
-  stats: {},
-  sprints: [],
-  filter: { sev: 'all', status: 'all', project: 'all' },
-  search: '',
-  currentTab: 'issues',
-};
+// ── Avatar colours ─────────────────────────────────────────────────────────
+const GRADS = ['linear-gradient(135deg,#7c3aed,#14b8a6)','linear-gradient(135deg,#f97316,#ef4444)','linear-gradient(135deg,#14b8a6,#3b82f6)','linear-gradient(135deg,#3b82f6,#7c3aed)','linear-gradient(135deg,#ef4444,#f97316)','linear-gradient(135deg,#14b8a6,#22c55e)','linear-gradient(135deg,#7c3aed,#ef4444)'];
+const AVC = {};
+function ac(n){ if(!AVC[n]){let h=0;for(let i=0;i<n.length;i++)h=n.charCodeAt(i)+((h<<5)-h);AVC[n]=GRADS[Math.abs(h)%GRADS.length];}return AVC[n]; }
+function ini(n){ return(n||'?').split(' ').slice(0,2).map(w=>w[0]?.toUpperCase()||'').join(''); }
 
-// ── Avatar colours pool ───────────────────────────────────────────────────────
-const AVATAR_COLORS = [
-  'linear-gradient(135deg,#6c63ff,#26c6b0)',
-  'linear-gradient(135deg,#ff9933,#ff4d4d)',
-  'linear-gradient(135deg,#26c6b0,#4d9fff)',
-  'linear-gradient(135deg,#4d9fff,#6c63ff)',
-  'linear-gradient(135deg,#ff4d4d,#ff9933)',
-  'linear-gradient(135deg,#26c6b0,#2ecc8a)',
-  'linear-gradient(135deg,#6c63ff,#ff4d4d)',
-  'linear-gradient(135deg,#2ecc8a,#4d9fff)',
-];
-const avatarCache = {};
-function avatarColor(name) {
-  if (!avatarCache[name]) {
-    let h = 0;
-    for (let i = 0; i < name.length; i++) h = name.charCodeAt(i) + ((h << 5) - h);
-    avatarCache[name] = AVATAR_COLORS[Math.abs(h) % AVATAR_COLORS.length];
+// ── API ────────────────────────────────────────────────────────────────────
+async function call(method,path,body){
+  const o={method,headers:{}};
+  if(body instanceof FormData){o.body=body;}
+  else if(body){o.headers['Content-Type']='application/json';o.body=JSON.stringify(body);}
+  const r=await fetch('/api'+path,o);
+  if(!r.ok){const e=await r.json().catch(()=>({}));throw new Error(e.error||'HTTP '+r.status);}
+  return r.json();
+}
+
+// ── Toast ──────────────────────────────────────────────────────────────────
+let TT;
+function toast(msg,type='ok'){
+  const el=document.getElementById('toast');
+  const ic=type==='ok'?'✓':type==='err'?'✕':'ℹ';
+  const cl=type==='ok'?'#22c55e':type==='err'?'#ef4444':'#3b82f6';
+  el.innerHTML=\`<span style="color:\${cl};font-weight:700;font-size:15px">\${ic}</span><span>\${msg}</span>\`;
+  el.classList.add('show');clearTimeout(TT);
+  TT=setTimeout(()=>el.classList.remove('show'),3200);
+}
+
+// ── Modal ──────────────────────────────────────────────────────────────────
+function openModal(title,html,onSub){
+  const o=document.getElementById('overlay'),m=document.getElementById('modal');
+  m.innerHTML=\`<div class="modal-hd">\${title}<button class="modal-x" onclick="closeModal()">✕</button></div><div id="mc">\${html}</div>\`;
+  o.classList.remove('hidden');
+  if(onSub){const f=m.querySelector('form');if(f)f.addEventListener('submit',async e=>{e.preventDefault();await onSub(new FormData(f));});}
+}
+function closeModal(){document.getElementById('overlay').classList.add('hidden');}
+document.getElementById('overlay').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModal();});
+
+// ── Navigation ─────────────────────────────────────────────────────────────
+const TITLES={dashboard:'Dashboard',issues:'Issues',ingest:'Ingest Data',analysis:'AI Analysis',patterns:'Team Insights',document:'Report'};
+function goTab(tab){
+  document.querySelectorAll('.nav-item[data-tab]').forEach(n=>n.classList.toggle('active',n.dataset.tab===tab));
+  document.querySelectorAll('.tab-panels>div').forEach(p=>p.classList.remove('active'));
+  document.getElementById('tab-'+tab)?.classList.add('active');
+  document.getElementById('page-title').textContent=TITLES[tab]||tab;
+  S.tab=tab;
+  if(tab==='dashboard')renderDashboard();
+  if(tab==='issues')renderTable();
+  if(tab==='analysis')renderAnalysis();
+  if(tab==='patterns')renderPatterns();
+  if(tab==='document')renderDoc();
+}
+document.querySelectorAll('.nav-item[data-tab]').forEach(el=>el.addEventListener('click',()=>goTab(el.dataset.tab)));
+document.querySelectorAll('[data-go]').forEach(el=>el.addEventListener('click',()=>goTab(el.dataset.go)));
+
+// ── Load data ──────────────────────────────────────────────────────────────
+async function loadAll(){
+  try{
+    const[iss,stats,spr]=await Promise.all([call('GET','/issues'),call('GET','/stats'),call('GET','/sprints?project=Phoenix')]);
+    S.issues=iss;S.stats=stats;S.sprints=spr;
+    const b=document.getElementById('nav-issues-badge');
+    if(b)b.textContent=stats.open||iss.length;
+    buildProjPills(stats.byProj||[]);
+    renderTable();
+    if(S.tab==='dashboard')renderDashboard();
+    // Check AI status
+    call('GET','/ai/status').then(st=>{
+      S.aiConfigured=st.configured;
+      showAIConfig(st);
+    }).catch(()=>{});
+  }catch(e){toast('Load failed: '+e.message,'err');}
+}
+
+function showAIConfig(st){
+  const b=document.getElementById('ai-config-banner');
+  if(!b)return;
+  if(st.configured){
+    b.className='ai-config-banner ok';
+    b.innerHTML=\`<span>✓</span><span>AI ready · Model: <strong>\${st.model}</strong>\${st.last_analysis?' · Last analysis: '+new Date(st.last_analysis).toLocaleString():''}</span>\`;
+  }else{
+    b.className='ai-config-banner';
+    b.innerHTML=\`<span>⚠</span><span>AI not configured — add <strong>OPENROUTER_API_KEY</strong> in Railway → Variables to enable AI classification &amp; analysis.</span>\`;
   }
-  return avatarCache[name];
-}
-function initials(name) {
-  return (name || '?').split(' ').slice(0, 2).map(w => w[0]?.toUpperCase() || '').join('');
+  b.classList.remove('hidden');
 }
 
-// ── API helpers ───────────────────────────────────────────────────────────────
-async function api(method, path, body) {
-  const opts = { method, headers: {} };
-  if (body instanceof FormData) {
-    opts.body = body;
-  } else if (body) {
-    opts.headers['Content-Type'] = 'application/json';
-    opts.body = JSON.stringify(body);
-  }
-  const res = await fetch('/api' + path, opts);
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || \`HTTP \${res.status}\`);
-  }
-  return res.json();
+// ── Project pills ──────────────────────────────────────────────────────────
+function buildProjPills(byProj){
+  const c=document.getElementById('proj-pills');if(!c)return;
+  c.innerHTML=byProj.map(p=>\`<button class="pill" data-proj="\${p.project}">\${p.project}</button>\`).join('');
+  c.querySelectorAll('.pill').forEach(p=>p.addEventListener('click',()=>{
+    c.querySelectorAll('.pill').forEach(x=>x.classList.remove('active'));
+    if(S.filter.project===p.dataset.proj){S.filter.project='all';}
+    else{S.filter.project=p.dataset.proj;p.classList.add('active');}
+    renderTable();
+  }));
 }
 
-// ── Toast ─────────────────────────────────────────────────────────────────────
-let toastTimer;
-function toast(msg, type = 'ok') {
-  const el = document.getElementById('toast');
-  const icon = type === 'ok' ? '✓' : type === 'err' ? '✕' : 'ℹ';
-  const color = type === 'ok' ? '#2ecc8a' : type === 'err' ? '#ff4d4d' : '#4d9fff';
-  el.innerHTML = \`<span style="color:\${color};margin-right:8px;font-weight:700">\${icon}</span>\${msg}\`;
-  el.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 3000);
-}
+// ── Dashboard ──────────────────────────────────────────────────────────────
+function renderDashboard(){
+  const s=S.stats;if(!s||!s.total)return;
+  const set=(id,v)=>{const e=document.getElementById(id);if(e)e.textContent=v;};
+  set('kpi-critical',s.critical);set('kpi-critical-bg',s.critical);
+  set('kpi-open',s.open);set('kpi-open-sub',\`across \${(s.byProj||[]).length} projects\`);set('kpi-open-bg',s.open);
+  set('kpi-health',s.health);set('kpi-health-bg',s.health);
+  set('kpi-resolved',s.resolved);set('kpi-resolved-sub',\`of \${s.total} total\`);set('kpi-resolved-bg',s.resolved);
 
-// ── Modal ─────────────────────────────────────────────────────────────────────
-function openModal(title, html, onSubmit) {
-  const overlay = document.getElementById('modal-overlay');
-  const modal   = document.getElementById('modal');
-  modal.innerHTML = \`
-    <div class="modal-title">
-      \${title}
-      <button class="modal-close" onclick="closeModal()">✕</button>
-    </div>
-    <div id="modal-content">\${html}</div>
-  \`;
-  overlay.classList.remove('hidden');
-  if (onSubmit) {
-    const form = modal.querySelector('form');
-    if (form) form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      await onSubmit(new FormData(form));
-    });
-  }
-}
-function closeModal() {
-  document.getElementById('modal-overlay').classList.add('hidden');
-}
-document.getElementById('modal-overlay').addEventListener('click', (e) => {
-  if (e.target === e.currentTarget) closeModal();
-});
-
-// ── Tab navigation ────────────────────────────────────────────────────────────
-const TAB_TITLES = {
-  dashboard: 'Dashboard', issues: 'Issues', ingest: 'Ingest Data',
-  analysis: 'AI Analysis', patterns: 'Pattern Intelligence', document: 'Documents',
-};
-function goTab(tab) {
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.tab === tab));
-  document.querySelectorAll('.tab-panels > div').forEach(p => p.classList.remove('active'));
-  document.getElementById('tab-' + tab)?.classList.add('active');
-  document.getElementById('page-title').textContent = TAB_TITLES[tab] || tab;
-  state.currentTab = tab;
-  if (tab === 'dashboard')  renderDashboard();
-  if (tab === 'issues')     renderIssuesTable();
-  if (tab === 'analysis')   renderAnalysis();
-  if (tab === 'patterns')   renderPatterns();
-  if (tab === 'document')   renderDocument();
-}
-document.querySelectorAll('.nav-item[data-tab]').forEach(el => {
-  el.addEventListener('click', () => goTab(el.dataset.tab));
-});
-document.querySelectorAll('[data-go]').forEach(el => {
-  el.addEventListener('click', () => goTab(el.dataset.go));
-});
-
-// ── Load all data ─────────────────────────────────────────────────────────────
-async function loadAll() {
-  try {
-    const [issues, stats, sprints] = await Promise.all([
-      api('GET', '/issues'),
-      api('GET', '/stats'),
-      api('GET', '/sprints?project=Phoenix'),
-    ]);
-    state.issues  = issues;
-    state.stats   = stats;
-    state.sprints = sprints;
-
-    // Update nav badge
-    const badge = document.getElementById('nav-badge-issues');
-    if (badge) badge.textContent = stats.open || issues.length;
-
-    // Inject project filter pills
-    buildProjectPills(stats.byProj || []);
-
-    renderIssuesTable();
-    if (state.currentTab === 'dashboard') renderDashboard();
-  } catch (e) {
-    toast('Failed to load data: ' + e.message, 'err');
-  }
-}
-
-// ── Project pills ─────────────────────────────────────────────────────────────
-function buildProjectPills(byProj) {
-  const container = document.getElementById('proj-pills');
-  if (!container) return;
-  container.innerHTML = byProj.map(p =>
-    \`<button class="pill" data-proj="\${p.project}">\${p.project}</button>\`
-  ).join('');
-  container.querySelectorAll('.pill').forEach(pill => {
-    pill.addEventListener('click', () => {
-      const all = [...document.querySelectorAll('#proj-pills .pill')];
-      all.forEach(p => p.classList.remove('active'));
-      if (state.filter.project === pill.dataset.proj) {
-        state.filter.project = 'all';
-      } else {
-        state.filter.project = pill.dataset.proj;
-        pill.classList.add('active');
-      }
-      renderIssuesTable();
-    });
-  });
-}
-
-// ── Dashboard ─────────────────────────────────────────────────────────────────
-function renderDashboard() {
-  const s = state.stats;
-  if (!s || !s.total) return;
-
-  // KPIs
-  setKPI('kpi-critical', s.critical,  s.critical);
-  setKPI('kpi-open',     s.open,      s.open);
-  setKPI('kpi-health',   s.health,    s.health);
-  setKPI('kpi-resolved', s.resolved,  s.resolved);
-  document.getElementById('kpi-open-sub').textContent = \`\${(s.byProj||[]).length} projects\`;
-  document.getElementById('kpi-resolved-sub').textContent = \`of \${s.total} total\`;
-
-  // Category bar chart
-  const cats = (s.byCat || []).slice(0, 6);
-  const maxC = cats[0]?.c || 1;
-  const catGrads = {
-    technical:   'linear-gradient(90deg,#6c63ff,#8b85ff)',
-    process:     'linear-gradient(90deg,#ff9933,#ffb84d)',
-    security:    'linear-gradient(90deg,#ff4d4d,#ff7a7a)',
-    environment: 'linear-gradient(90deg,#26c6b0,#4de0ce)',
-    quality:     'linear-gradient(90deg,#4d9fff,#7ab8ff)',
-  };
-  document.getElementById('cat-chart').innerHTML = cats.map(c => \`
-    <div class="bar-row">
-      <div class="bar-label">\${c.category || 'other'}</div>
-      <div class="bar-track"><div class="bar-fill" style="width:\${Math.round((c.c/maxC)*90+10)}%;background:\${catGrads[c.category]||'var(--bg4)'};">\${c.c}</div></div>
-      <div class="bar-num">\${c.c}</div>
+  // Category bars
+  const cats=(s.byCat||[]).slice(0,6),maxC=cats[0]?.c||1;
+  const CG={technical:'linear-gradient(90deg,#7c3aed,#8b5cf6)',process:'linear-gradient(90deg,#f97316,#fb923c)',security:'linear-gradient(90deg,#ef4444,#f87171)',environment:'linear-gradient(90deg,#14b8a6,#2dd4bf)',quality:'linear-gradient(90deg,#3b82f6,#60a5fa)',other:'linear-gradient(90deg,#52525b,#71717a)'};
+  document.getElementById('cat-chart').innerHTML=cats.map(c=>\`
+    <div class="bc-row">
+      <div class="bc-label">\${c.category||'other'}</div>
+      <div class="bc-track"><div class="bc-fill" style="width:\${Math.round((c.c/maxC)*88+8)}%;background:\${CG[c.category]||CG.other}">\${c.c}</div></div>
+      <div class="bc-num">\${c.c}</div>
     </div>\`).join('');
 
-  // Donut
-  renderDonut(s.bySev || []);
+  renderDonut(s.bySev||[]);
 
-  // Project bar chart
-  const projs = (s.byProj || []).slice(0, 5);
-  const maxP = projs[0]?.c || 1;
-  const projGrads = [
-    'linear-gradient(90deg,#6c63ff,#8b85ff)',
-    'linear-gradient(90deg,#26c6b0,#4de0ce)',
-    'linear-gradient(90deg,#ff9933,#ffb84d)',
-    'linear-gradient(90deg,#4d9fff,#7ab8ff)',
-    'linear-gradient(90deg,#2ecc8a,#4de0ce)',
-  ];
-  document.getElementById('proj-chart').innerHTML = projs.map((p, i) => \`
-    <div class="bar-row">
-      <div class="bar-label">\${p.project}</div>
-      <div class="bar-track"><div class="bar-fill" style="width:\${Math.round((p.c/maxP)*85+10)}%;background:\${projGrads[i%projGrads.length]};">\${p.c}</div></div>
-      <div class="bar-num">\${p.c}</div>
+  // Project bars
+  const projs=(s.byProj||[]).slice(0,5),maxP=projs[0]?.c||1;
+  const PG=['linear-gradient(90deg,#7c3aed,#8b5cf6)','linear-gradient(90deg,#14b8a6,#2dd4bf)','linear-gradient(90deg,#f97316,#fb923c)','linear-gradient(90deg,#3b82f6,#60a5fa)'];
+  document.getElementById('proj-chart').innerHTML=projs.map((p,i)=>\`
+    <div class="bc-row">
+      <div class="bc-label">\${p.project}</div>
+      <div class="bc-track"><div class="bc-fill" style="width:\${Math.round((p.c/maxP)*88+8)}%;background:\${PG[i%PG.length]}">\${p.c}</div></div>
+      <div class="bc-num">\${p.c}</div>
     </div>\`).join('');
 }
 
-function setKPI(id, val, bgVal) {
-  const el = document.getElementById(id);
-  const bg = document.getElementById(id + '-bg');
-  if (el) el.textContent = val;
-  if (bg) bg.textContent = bgVal;
+function renderDonut(bySev){
+  const SEV=[{k:'critical',c:'#ef4444',l:'Critical'},{k:'high',c:'#f97316',l:'High'},{k:'medium',c:'#3b82f6',l:'Medium'},{k:'low',c:'#22c55e',l:'Low'}];
+  const map={};bySev.forEach(s=>{map[s.severity]=s.c;});
+  const total=Object.values(map).reduce((a,b)=>a+b,0)||1;
+  const C=2*Math.PI*40;let off=0;
+  const segs=SEV.map(s=>{const n=map[s.k]||0,d=(n/total)*C,seg={...s,n,d,off};off+=d;return seg;});
+  const svg=document.getElementById('donut-svg');
+  svg.innerHTML=\`<circle cx="55" cy="55" r="40" fill="none" stroke="#27272a" stroke-width="16"/>\` +
+    segs.map(s=>s.n?\`<circle cx="55" cy="55" r="40" fill="none" stroke="\${s.c}" stroke-width="16" stroke-dasharray="\${s.d.toFixed(1)} \${(C-s.d).toFixed(1)}" stroke-dashoffset="\${(-s.off).toFixed(1)}" transform="rotate(-90 55 55)"/>\` : '').join('')+
+    \`<text x="55" y="51" text-anchor="middle" fill="#fafafa" font-size="14" font-family="Syne,sans-serif" font-weight="800">\${total}</text><text x="55" y="63" text-anchor="middle" fill="#52525b" font-size="9">issues</text>\`;
+  document.getElementById('donut-legend').innerHTML=SEV.map(s=>\`
+    <div class="dl-row"><div class="dl-dot" style="background:\${s.c}"></div>\${s.l}<div class="dl-val">\${map[s.k]||0}</div></div>\`).join('');
 }
 
-function renderDonut(bySev) {
-  const SEV = [
-    { key: 'critical', color: '#ff4d4d', label: 'Critical' },
-    { key: 'high',     color: '#ff9933', label: 'High' },
-    { key: 'medium',   color: '#4d9fff', label: 'Medium' },
-    { key: 'low',      color: '#2ecc8a', label: 'Low' },
-  ];
-  const map = {};
-  bySev.forEach(s => { map[s.severity] = s.c; });
-  const total = Object.values(map).reduce((a, b) => a + b, 0) || 1;
-  const C = 2 * Math.PI * 40; // circumference
+// ── Issues table ───────────────────────────────────────────────────────────
+const SC={critical:'sev-critical',high:'sev-high',medium:'sev-medium',low:'sev-low'};
+const DC={open:'var(--red)',resolved:'var(--green)','in review':'var(--yellow)'};
 
-  let offset = 0;
-  const segments = SEV.map(s => {
-    const count = map[s.key] || 0;
-    const dash  = (count / total) * C;
-    const seg   = { ...s, count, dash, offset };
-    offset += dash;
-    return seg;
-  });
-
-  const svg = document.getElementById('donut-svg');
-  svg.innerHTML = \`<circle cx="55" cy="55" r="40" fill="none" stroke="#1a1e28" stroke-width="18"/>\` +
-    segments.map(s => s.count ? \`<circle cx="55" cy="55" r="40" fill="none" stroke="\${s.color}" stroke-width="18" stroke-dasharray="\${s.dash.toFixed(1)} \${(C - s.dash).toFixed(1)}" stroke-dashoffset="\${(-s.offset).toFixed(1)}" transform="rotate(-90 55 55)"/>\` : '').join('') +
-    \`<text x="55" y="50" text-anchor="middle" fill="#e8eaf0" font-size="14" font-family="Syne,sans-serif" font-weight="800">\${total}</text>
-     <text x="55" y="63" text-anchor="middle" fill="#555e78" font-size="9">issues</text>\`;
-
-  document.getElementById('donut-legend').innerHTML = SEV.map(s => \`
-    <div class="legend-row">
-      <div class="legend-dot" style="background:\${s.color}"></div>
-      \${s.label}
-      <div class="legend-val">\${map[s.key] || 0}</div>
-    </div>\`).join('');
-}
-
-// ── Issues table ──────────────────────────────────────────────────────────────
-function sevClass(s) {
-  return { critical: 'sev-critical', high: 'sev-high', medium: 'sev-medium', low: 'sev-low' }[s] || 'sev-low';
-}
-function statusColor(s) {
-  return { open: 'var(--red)', resolved: 'var(--green)', 'in review': 'var(--yellow)' }[s] || 'var(--text3)';
-}
-
-function filteredIssues() {
-  const { sev, status, project } = state.filter;
-  const search = state.search.toLowerCase();
-  return state.issues.filter(i => {
-    if (sev !== 'all' && i.severity !== sev) return false;
-    if (status !== 'all' && i.status !== status) return false;
-    if (project !== 'all' && i.project.toLowerCase() !== project.toLowerCase()) return false;
-    if (search && !\`\${i.title} \${i.reporter} \${i.project} \${i.description}\`.toLowerCase().includes(search)) return false;
+function filtered(){
+  const {sev,status,project}=S.filter,q=S.search.toLowerCase();
+  return S.issues.filter(i=>{
+    if(sev!=='all'&&i.severity!==sev)return false;
+    if(status!=='all'&&i.status!==status)return false;
+    if(project!=='all'&&i.project.toLowerCase()!==project.toLowerCase())return false;
+    if(q&&!\`\${i.title} \${i.reporter} \${i.project} \${i.description}\`.toLowerCase().includes(q))return false;
     return true;
   });
 }
 
-function renderIssuesTable() {
-  const tbody  = document.getElementById('issues-tbody');
-  const issues = filteredIssues();
-
-  if (!issues.length) {
-    tbody.innerHTML = \`<tr><td colspan="9"><div class="empty-state"><big>◈</big>No issues match your filters</div></td></tr>\`;
-    return;
-  }
-
-  tbody.innerHTML = issues.map((iss, idx) => \`
-    <tr data-id="\${iss.id}">
-      <td style="color:var(--text3);font-family:var(--font-mono);font-size:11px">\${String(idx + 1).padStart(2, '0')}</td>
-      <td style="max-width:280px">
-        <span style="font-weight:500;cursor:pointer;color:var(--text)" onclick="editIssue('\${iss.id}')">\${esc(iss.title)}</span>
-        \${iss.source === 'teams' ? '<span style="font-size:9px;color:var(--text3);margin-left:6px;font-family:var(--font-mono)">TEAMS</span>' : ''}
-        \${iss.source === 'csv'   ? '<span style="font-size:9px;color:var(--text3);margin-left:6px;font-family:var(--font-mono)">CSV</span>' : ''}
+function renderTable(){
+  const tb=document.getElementById('issues-tbody'),rows=filtered();
+  if(!rows.length){tb.innerHTML=\`<tr><td colspan="9"><div class="empty"><div class="empty-icon">◈</div><div class="empty-title">No issues found</div><div class="empty-sub">Try a different filter or add a new issue.</div></div></td></tr>\`;return;}
+  tb.innerHTML=rows.map((i,n)=>\`
+    <tr>
+      <td style="color:var(--text3);font-family:var(--font-m);font-size:11px">\${String(n+1).padStart(2,'0')}</td>
+      <td style="max-width:260px">
+        <span style="font-weight:500;cursor:pointer" onclick="editIssue('\${i.id}')">\${esc(i.title)}</span>
+        \${i.source==='teams'?'<span style="font-size:9px;color:var(--text3);margin-left:5px;font-family:var(--font-m)">TEAMS</span>':''}
+        \${i.source==='csv'?'<span style="font-size:9px;color:var(--text3);margin-left:5px;font-family:var(--font-m)">CSV</span>':''}
       </td>
-      <td style="color:var(--accent2)">\${esc(iss.project)}</td>
-      <td>
-        <div style="display:flex;align-items:center;gap:7px">
-          <div class="r-avatar" style="background:\${avatarColor(iss.reporter)}">\${initials(iss.reporter)}</div>
-          <span style="color:var(--text2);font-size:12px">\${esc(iss.reporter)}</span>
-        </div>
-      </td>
-      <td><span class="sev-badge \${sevClass(iss.severity)}">● \${iss.severity}</span></td>
-      <td>\${iss.category ? \`<span class="cat-tag">\${esc(iss.category)}</span>\` : '<span style="color:var(--text3)">—</span>'}</td>
-      <td style="font-size:11px;color:var(--text2);max-width:200px">\${esc(iss.root_cause) || '<span style="color:var(--text3)">—</span>'}</td>
-      <td>
-        <span class="status-dot" style="background:\${statusColor(iss.status)}"></span>
-        <span style="color:var(--text2);font-size:12px">\${iss.status}</span>
-      </td>
-      <td>
-        <div style="display:flex;gap:4px">
-          \${iss.status !== 'resolved'
-            ? \`<button class="action-btn resolve" onclick="resolveIssue('\${iss.id}')">✓</button>\`
-            : \`<button class="action-btn" onclick="reopenIssue('\${iss.id}')">↺</button>\`}
-          <button class="action-btn delete" onclick="deleteIssue('\${iss.id}')">✕</button>
-        </div>
-      </td>
+      <td style="color:var(--accent2);font-size:12px">\${esc(i.project)}</td>
+      <td><div style="display:flex;align-items:center;gap:6px"><div class="rav" style="background:\${ac(i.reporter)}">\${ini(i.reporter)}</div><span style="color:var(--text2);font-size:12px">\${esc(i.reporter)}</span></div></td>
+      <td><span class="sev \${SC[i.severity]||'sev-low'}">● \${i.severity}</span></td>
+      <td>\${i.category?\`<span class="cat">\${esc(i.category)}</span>\`:'<span style="color:var(--text3)">—</span>'}</td>
+      <td style="font-size:11px;color:var(--text3);max-width:180px">\${esc(i.root_cause)||'<span style="color:var(--text3)">—</span>'}</td>
+      <td><span class="rdot" style="background:\${DC[i.status]||'var(--text3)'}"></span><span style="color:var(--text2);font-size:12px">\${i.status}</span></td>
+      <td><div style="display:flex;gap:3px">
+        \${i.status!=='resolved'?\`<button class="act-btn ok" onclick="resolveIssue('\${i.id}')">✓</button>\`:\`<button class="act-btn" onclick="reopenIssue('\${i.id}')">↺</button>\`}
+        <button class="act-btn del" onclick="deleteIssue('\${i.id}')">✕</button>
+      </div></td>
     </tr>\`).join('');
 }
 
-// ── Filter pills ──────────────────────────────────────────────────────────────
-document.getElementById('filter-pills').addEventListener('click', e => {
-  const pill = e.target.closest('[data-filter]');
-  if (!pill) return;
-  document.querySelectorAll('#filter-pills .pill').forEach(p => p.classList.remove('active'));
-  pill.classList.add('active');
-  const f = pill.dataset.filter;
-  if (f === 'all')      { state.filter.sev = 'all'; state.filter.status = 'all'; }
-  else if (f === 'open')     { state.filter.status = 'open'; state.filter.sev = 'all'; }
-  else if (f === 'resolved') { state.filter.status = 'resolved'; state.filter.sev = 'all'; }
-  else if (f === 'critical') { state.filter.sev = 'critical'; state.filter.status = 'all'; }
-  renderIssuesTable();
+// ── Filter pills ───────────────────────────────────────────────────────────
+document.getElementById('filter-pills').addEventListener('click',e=>{
+  const p=e.target.closest('[data-filter]');if(!p)return;
+  document.querySelectorAll('#filter-pills .pill').forEach(x=>x.classList.remove('active'));
+  p.classList.add('active');
+  const f=p.dataset.filter;
+  S.filter.sev='all';S.filter.status='all';
+  if(f==='open')S.filter.status='open';
+  else if(f==='resolved')S.filter.status='resolved';
+  else if(f==='critical')S.filter.sev='critical';
+  renderTable();
+});
+document.getElementById('global-search').addEventListener('input',e=>{
+  S.search=e.target.value;
+  if(S.tab==='issues')renderTable();
 });
 
-// ── Search ────────────────────────────────────────────────────────────────────
-document.getElementById('global-search').addEventListener('input', e => {
-  state.search = e.target.value;
-  if (state.currentTab === 'issues') renderIssuesTable();
-});
-
-// ── Issue actions ─────────────────────────────────────────────────────────────
-async function resolveIssue(id) {
-  try {
-    await api('PATCH', \`/issues/\${id}\`, { status: 'resolved' });
-    const i = state.issues.find(x => x.id === id);
-    if (i) i.status = 'resolved';
-    renderIssuesTable();
-    await refreshStats();
-    toast('Issue marked resolved');
-  } catch (e) { toast(e.message, 'err'); }
+// ── Issue actions ──────────────────────────────────────────────────────────
+async function resolveIssue(id){
+  try{await call('PATCH',\`/issues/\${id}\`,{status:'resolved'});const i=S.issues.find(x=>x.id===id);if(i)i.status='resolved';renderTable();await refreshStats();toast('Resolved ✓');}catch(e){toast(e.message,'err');}
 }
-
-async function reopenIssue(id) {
-  try {
-    await api('PATCH', \`/issues/\${id}\`, { status: 'open' });
-    const i = state.issues.find(x => x.id === id);
-    if (i) i.status = 'open';
-    renderIssuesTable();
-    await refreshStats();
-    toast('Issue reopened');
-  } catch (e) { toast(e.message, 'err'); }
+async function reopenIssue(id){
+  try{await call('PATCH',\`/issues/\${id}\`,{status:'open'});const i=S.issues.find(x=>x.id===id);if(i)i.status='open';renderTable();await refreshStats();toast('Reopened');}catch(e){toast(e.message,'err');}
 }
-
-async function deleteIssue(id) {
-  if (!confirm('Delete this issue? This cannot be undone.')) return;
-  try {
-    await api('DELETE', \`/issues/\${id}\`);
-    state.issues = state.issues.filter(x => x.id !== id);
-    renderIssuesTable();
-    await refreshStats();
-    toast('Issue deleted');
-  } catch (e) { toast(e.message, 'err'); }
+async function deleteIssue(id){
+  if(!confirm('Delete this issue?'))return;
+  try{await call('DELETE',\`/issues/\${id}\`);S.issues=S.issues.filter(x=>x.id!==id);renderTable();await refreshStats();toast('Deleted');}catch(e){toast(e.message,'err');}
 }
-
-function editIssue(id) {
-  const iss = state.issues.find(x => x.id === id);
-  if (!iss) return;
-  openModal('Edit Issue', \`
-    <form id="edit-form">
+function editIssue(id){
+  const i=S.issues.find(x=>x.id===id);if(!i)return;
+  openModal('Edit Issue',\`
+    <form id="ef">
       <div class="form-grid">
-        <div class="form-group form-full"><label>Title</label><input name="title" value="\${esc(iss.title)}" required/></div>
-        <div class="form-group form-full"><label>Description</label><textarea name="description">\${esc(iss.description)}</textarea></div>
-        <div class="form-group"><label>Reporter</label><input name="reporter" value="\${esc(iss.reporter)}"/></div>
-        <div class="form-group"><label>Project</label>
-          <select name="project">\${['Phoenix','Atlas','Horizon','General'].map(p => \`<option \${p===iss.project?'selected':''}>\${p}</option>\`).join('')}</select>
-        </div>
-        <div class="form-group"><label>Severity</label>
-          <select name="severity">\${['critical','high','medium','low'].map(s => \`<option \${s===iss.severity?'selected':''}>\${s}</option>\`).join('')}</select>
-        </div>
-        <div class="form-group"><label>Status</label>
-          <select name="status">\${['open','in review','resolved','wontfix'].map(s => \`<option \${s===iss.status?'selected':''}>\${s}</option>\`).join('')}</select>
-        </div>
-        <div class="form-group"><label>Category</label>
-          <select name="category">\${['','technical','process','security','quality','environment','other'].map(c => \`<option \${c===iss.category?'selected':''}>\${c}</option>\`).join('')}</select>
-        </div>
-        <div class="form-group form-full"><label>Root Cause</label><input name="root_cause" value="\${esc(iss.root_cause)}"/></div>
+        <div class="fg form-full"><label>Title</label><input name="title" value="\${esc(i.title)}" required/></div>
+        <div class="fg form-full"><label>Description</label><textarea name="description">\${esc(i.description)}</textarea></div>
+        <div class="fg"><label>Reporter</label><input name="reporter" value="\${esc(i.reporter)}"/></div>
+        <div class="fg"><label>Project</label><select name="project">\${['Phoenix','Atlas','Horizon','General'].map(p=>\`<option \${p===i.project?'selected':''}>\${p}</option>\`).join('')}</select></div>
+        <div class="fg"><label>Severity</label><select name="severity">\${['critical','high','medium','low'].map(s=>\`<option \${s===i.severity?'selected':''}>\${s}</option>\`).join('')}</select></div>
+        <div class="fg"><label>Status</label><select name="status">\${['open','in review','resolved','wontfix'].map(s=>\`<option \${s===i.status?'selected':''}>\${s}</option>\`).join('')}</select></div>
+        <div class="fg"><label>Category</label><select name="category">\${['','technical','process','security','quality','environment','other'].map(c=>\`<option \${c===i.category?'selected':''}>\${c}</option>\`).join('')}</select></div>
+        <div class="fg form-full"><label>Root Cause</label><input name="root_cause" value="\${esc(i.root_cause)}"/></div>
       </div>
-      <div style="display:flex;gap:10px;margin-top:16px">
+      <div style="display:flex;gap:8px;margin-top:14px">
         <button type="submit" class="btn btn-primary">Save Changes</button>
-        <button type="button" class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+        <button type="button" class="btn btn-ghost btn-sm" onclick="closeModal()">Cancel</button>
       </div>
-    </form>
-  \`);
-  document.getElementById('edit-form').addEventListener('submit', async (e) => {
+    </form>\`);
+  document.getElementById('ef').addEventListener('submit',async e=>{
     e.preventDefault();
-    const fd = new FormData(e.target);
-    const data = Object.fromEntries(fd);
-    try {
-      const updated = await api('PATCH', \`/issues/\${id}\`, data);
-      const idx = state.issues.findIndex(x => x.id === id);
-      if (idx >= 0) state.issues[idx] = updated;
-      renderIssuesTable();
-      await refreshStats();
-      closeModal();
-      toast('Issue updated');
-    } catch (err) { toast(err.message, 'err'); }
+    try{const d=Object.fromEntries(new FormData(e.target));const u=await call('PATCH',\`/issues/\${id}\`,d);const x=S.issues.findIndex(x=>x.id===id);if(x>=0)S.issues[x]=u;renderTable();await refreshStats();closeModal();toast('Updated ✓');}
+    catch(err){toast(err.message,'err');}
   });
 }
 
-// ── Add Issue form ────────────────────────────────────────────────────────────
-function bindAddIssueBtn(btnId) {
-  document.getElementById(btnId)?.addEventListener('click', () => {
-    goTab('ingest');
-    setTimeout(() => {
-      document.getElementById('manual-form-section')?.scrollIntoView({ behavior: 'smooth' });
-    }, 100);
-  });
-}
-bindAddIssueBtn('btn-add-issue');
-bindAddIssueBtn('btn-add-issue2');
-
-document.getElementById('btn-open-form')?.addEventListener('click', () => {
-  document.getElementById('manual-form-section')?.scrollIntoView({ behavior: 'smooth' });
-});
-
-document.getElementById('issue-form')?.addEventListener('submit', async (e) => {
+// ── Add issue form ─────────────────────────────────────────────────────────
+['btn-add-issue','btn-add-issue2'].forEach(id=>document.getElementById(id)?.addEventListener('click',()=>{goTab('ingest');setTimeout(()=>document.getElementById('manual-form-section')?.scrollIntoView({behavior:'smooth'}),80);}));
+document.getElementById('btn-open-form')?.addEventListener('click',()=>document.getElementById('manual-form-section')?.scrollIntoView({behavior:'smooth'}));
+document.getElementById('issue-form')?.addEventListener('submit',async e=>{
   e.preventDefault();
-  const fd     = new FormData(e.target);
-  const data   = Object.fromEntries(fd);
-  const status = document.getElementById('form-status');
-  try {
-    status.textContent = 'Saving…';
-    const issue = await api('POST', '/issues', data);
-    state.issues.unshift(issue);
-    await refreshStats();
-    e.target.reset();
-    status.textContent = '';
-    toast('Issue saved successfully');
-  } catch (err) {
-    status.textContent = err.message;
-    toast(err.message, 'err');
-  }
+  const st=document.getElementById('form-status');
+  try{st.textContent='Saving…';const d=Object.fromEntries(new FormData(e.target));const iss=await call('POST','/issues',d);S.issues.unshift(iss);await refreshStats();e.target.reset();st.textContent='';toast('Issue saved ✓');}
+  catch(err){st.textContent=err.message;toast(err.message,'err');}
+});
+document.getElementById('btn-form-reset')?.addEventListener('click',()=>{document.getElementById('issue-form')?.reset();document.getElementById('form-status').textContent='';});
+
+// ── CSV upload ─────────────────────────────────────────────────────────────
+document.getElementById('csv-upload')?.addEventListener('change',async e=>{
+  const f=e.target.files[0];if(!f)return;
+  toast('Uploading…','info');
+  try{const fd=new FormData();fd.append('file',f);const r=await fetch('/api/issues/import-csv',{method:'POST',body:fd});if(!r.ok)throw new Error('Upload failed');const d=await r.json();S.issues=[...d.issues,...S.issues];await refreshStats();toast(\`Imported \${d.imported} issues ✓\`);}
+  catch(err){toast(err.message,'err');}
+  e.target.value='';
 });
 
-document.getElementById('btn-form-reset')?.addEventListener('click', () => {
-  document.getElementById('issue-form')?.reset();
-  document.getElementById('form-status').textContent = '';
-});
-
-// ── CSV Upload ────────────────────────────────────────────────────────────────
-document.getElementById('csv-upload')?.addEventListener('change', async (e) => {
-  const file = e.target.files[0];
-  if (!file) return;
-  toast('Uploading CSV…', 'info');
-  try {
-    const fd = new FormData();
-    fd.append('file', file);
-    const result = await fetch('/api/issues/import-csv', { method: 'POST', body: fd });
-    if (!result.ok) throw new Error('Upload failed');
-    const data = await result.json();
-    state.issues = [...data.issues, ...state.issues];
-    await refreshStats();
-    toast(\`Imported \${data.imported} issues from CSV\`);
-  } catch (err) { toast(err.message, 'err'); }
-  e.target.value = '';
-});
-
-// ── Export CSV ────────────────────────────────────────────────────────────────
-document.getElementById('btn-export')?.addEventListener('click', () => {
-  const url = new URL('/api/issues/export-csv', location.href);
-  const { sev, status, project } = state.filter;
-  if (sev !== 'all')     url.searchParams.set('severity', sev);
-  if (status !== 'all')  url.searchParams.set('status', status);
-  if (project !== 'all') url.searchParams.set('project', project);
-  if (state.search)      url.searchParams.set('search', state.search);
-  const a = document.createElement('a');
-  a.href = url.toString();
-  a.download = 'issues.csv';
-  a.click();
+// ── Export ─────────────────────────────────────────────────────────────────
+document.getElementById('btn-export')?.addEventListener('click',()=>{
+  const u=new URL('/api/issues/export-csv',location.href);
+  const{sev,status,project}=S.filter;
+  if(sev!=='all')u.searchParams.set('severity',sev);
+  if(status!=='all')u.searchParams.set('status',status);
+  if(project!=='all')u.searchParams.set('project',project);
+  if(S.search)u.searchParams.set('search',S.search);
+  Object.assign(document.createElement('a'),{href:u.toString(),download:'issues.csv'}).click();
   toast('CSV download started');
 });
 
-// ── Teams mock ingest ─────────────────────────────────────────────────────────
-document.getElementById('btn-teams-ingest')?.addEventListener('click', async () => {
-  const mockIssues = [
-    { title: 'Teams: Deployment pipeline failing on feature branch merges', reporter: 'Shreya Iyer', project: 'Phoenix', severity: 'high', category: 'technical', description: 'Raised in #phoenix-dev. Pipeline fails silently on merge.' },
-    { title: 'Teams: Redis cache eviction causing session drops', reporter: 'Manish Kapoor', project: 'Atlas', severity: 'high', category: 'technical', description: 'Cache eviction policy too aggressive under load.' },
-    { title: 'Teams: Sprint planning meeting not reflected in backlog', reporter: 'Ananya Roy', project: 'Horizon', severity: 'medium', category: 'process', description: 'Jira not updated after sprint planning on Monday.' },
+// ── Teams mock ─────────────────────────────────────────────────────────────
+document.getElementById('btn-teams-ingest')?.addEventListener('click',async()=>{
+  const btn=document.getElementById('btn-teams-ingest');
+  btn.disabled=true;btn.textContent='Syncing…';
+  const mock=[
+    {title:'Teams: Deployment pipeline failing on feature branch merges',reporter:'Shreya Iyer',project:'Phoenix',severity:'high',category:'technical',description:'Raised in #phoenix-dev. Pipeline fails silently on merge.'},
+    {title:'Teams: Redis cache eviction causing session drops',reporter:'Manish Kapoor',project:'Atlas',severity:'high',category:'technical',description:'Cache eviction policy too aggressive under load.'},
+    {title:'Teams: Onboarding doc missing for new joiners',reporter:'Ananya Roy',project:'Horizon',severity:'medium',category:'process',description:'No updated onboarding doc since last quarter.'},
   ];
-  try {
-    const btn = document.getElementById('btn-teams-ingest');
-    btn.disabled = true; btn.textContent = 'Syncing…';
-    for (const iss of mockIssues) {
-      const created = await api('POST', '/issues', { ...iss, source: 'teams', status: 'open' });
-      state.issues.unshift(created);
-    }
-    await refreshStats();
-    toast(\`Ingested \${mockIssues.length} issues from Teams\`);
-  } catch (e) { toast(e.message, 'err'); }
-  const btn = document.getElementById('btn-teams-ingest');
-  if (btn) { btn.disabled = false; btn.textContent = '↓ Ingest Mock Data'; }
+  try{for(const m of mock){const c=await call('POST','/issues',{...m,source:'teams',status:'open'});S.issues.unshift(c);}await refreshStats();toast(\`Ingested \${mock.length} issues from Teams\`);}
+  catch(e){toast(e.message,'err');}
+  btn.disabled=false;btn.textContent='↓ Ingest Mock Data';
 });
 
-// ── AI Classify simulation ────────────────────────────────────────────────────
-const AI_STEPS = [
-  'Connecting to AI engine…',
-  'Reading issue titles and descriptions…',
-  'Assigning category tags…',
-  'Evaluating severity scores…',
-  'Generating root cause hypotheses…',
-  'Computing team health score…',
-  'Analysis complete ✓',
-];
+// ── AI bar helpers ─────────────────────────────────────────────────────────
+function showAIBar(msg='Working…'){
+  const b=document.getElementById('ai-bar');
+  b.classList.add('show');
+  document.getElementById('ai-text').textContent=msg;
+  document.getElementById('ai-prog').style.width='5%';
+  document.getElementById('ai-counter').textContent='';
+}
+function updateAIBar(msg,pct,counter=''){
+  document.getElementById('ai-text').textContent=msg;
+  document.getElementById('ai-prog').style.width=pct+'%';
+  document.getElementById('ai-counter').textContent=counter;
+}
+function hideAIBar(){document.getElementById('ai-bar').classList.remove('show');}
+document.getElementById('ai-cancel')?.addEventListener('click',hideAIBar);
 
-document.getElementById('btn-classify')?.addEventListener('click', () => {
-  runAIAnimation(() => {
-    toast('Classification complete — all issues categorised');
-    renderDashboard();
-  });
+// ── AI Classify ────────────────────────────────────────────────────────────
+document.getElementById('btn-classify')?.addEventListener('click',async()=>{
+  if(!S.aiConfigured){toast('Add OPENROUTER_API_KEY in Railway → Variables to enable AI','err');return;}
+  showAIBar('Classifying issues with AI…');goTab('dashboard');
+  updateAIBar('Sending issues to AI model…',20);
+  try{
+    const r=await call('POST','/ai/classify',{});
+    updateAIBar('Updating issue records…',80);
+    const[iss,stats]=await Promise.all([call('GET','/issues'),call('GET','/stats')]);
+    S.issues=iss;S.stats=stats;
+    updateAIBar('Done ✓',100,\`\${r.updated} classified\`);
+    setTimeout(()=>{hideAIBar();renderDashboard();renderTable();toast(\`\${r.message}\`);},800);
+  }catch(e){hideAIBar();toast('AI classify failed: '+e.message,'err');}
 });
 
-document.getElementById('btn-run-analysis')?.addEventListener('click', () => {
-  runAIAnimation(() => {
-    toast('Analysis complete');
-    renderAnalysis();
-  });
+// ── AI Analysis ────────────────────────────────────────────────────────────
+document.getElementById('btn-run-analysis')?.addEventListener('click',async()=>{
+  if(!S.aiConfigured){toast('Add OPENROUTER_API_KEY in Railway → Variables to enable AI','err');return;}
+  showAIBar('Running AI analysis…');
+  updateAIBar('Analysing issue patterns…',15);
+  try{
+    updateAIBar('Generating insights…',45);
+    const r=await call('POST','/ai/analyse',{});
+    updateAIBar('Building recommendations…',80);
+    S.stats=await call('GET','/stats');
+    hideAIBar();
+    renderAnalysisFromAI(r);
+    goTab('analysis');
+    toast('AI analysis complete ✓');
+    document.getElementById('nav-doc-badge').style.display='';
+  }catch(e){hideAIBar();toast('Analysis failed: '+e.message,'err');}
 });
 
-function runAIAnimation(onDone) {
-  const bar     = document.getElementById('ai-status');
-  const fill    = document.getElementById('prog-fill');
-  const text    = document.getElementById('ai-status-text');
-  const counter = document.getElementById('ai-counter');
-  const total   = state.issues.length || 18;
-
-  bar.classList.remove('hidden');
-  goTab('dashboard');
-
-  let step = 0;
-  const tick = () => {
-    if (step >= AI_STEPS.length) {
-      setTimeout(() => bar.classList.add('hidden'), 1000);
-      onDone && onDone();
-      return;
-    }
-    text.textContent    = AI_STEPS[step];
-    fill.style.width    = \`\${Math.round((step / (AI_STEPS.length - 1)) * 100)}%\`;
-    counter.textContent = \`\${Math.min(total, Math.round((step / AI_STEPS.length) * total))} / \${total}\`;
-    step++;
-    setTimeout(tick, 550 + Math.random() * 300);
-  };
-  tick();
+function renderAnalysisFromAI(r){
+  document.getElementById('health-score').textContent=r.team_health_score??S.stats.health;
+  document.getElementById('health-score').style.color=parseFloat(r.team_health_score)>=7?'var(--green)':parseFloat(r.team_health_score)>=4?'var(--yellow)':'var(--red)';
+  document.getElementById('health-subs').innerHTML=(r.top_risks||[]).slice(0,3).map(risk=>\`<div class="hs-row"><span>\${risk.slice(0,22)}…</span></div>\`).join('');
+  document.getElementById('analysis-title').textContent='AI Analysis';
+  const rb=document.getElementById('ai-result-banner');
+  rb.innerHTML=r.executive_summary||'';rb.classList.add('show');
+  const s=S.stats;
+  document.getElementById('analysis-metrics').innerHTML=[
+    {l:'Total',v:s.total,c:'var(--text)'},{l:'Open',v:s.open,c:'var(--orange)'},{l:'Critical',v:s.critical,c:'var(--red)'},{l:'Resolved',v:s.resolved,c:'var(--green)'}
+  ].map(m=>\`<div class="hm"><div class="hm-val" style="color:\${m.c}">\${m.v}</div><div class="hm-lbl">\${m.l}</div></div>\`).join('');
+  document.getElementById('analysis-grid').classList.remove('hidden');
+  // Cats
+  const cats=(s.byCat||[]).slice(0,5),maxC=cats[0]?.c||1;
+  document.getElementById('analysis-cats').innerHTML=cats.map(c=>\`
+    <div class="pat-item" style="border-left-color:\${['#7c3aed','#f97316','#ef4444','#3b82f6','#14b8a6'][cats.indexOf(c)%5]}">
+      <div class="pat-title">\${c.category||'other'}</div>
+      <div class="pat-sub">\${c.c} issue\${c.c!==1?'s':''}</div>
+      <div style="margin-top:5px;background:var(--bg4);border-radius:2px;height:3px;overflow:hidden"><div style="height:100%;width:\${Math.round((c.c/maxC)*100)}%;background:var(--accent);border-radius:2px"></div></div>
+    </div>\`).join('');
+  // Projects
+  const projs=s.byProj||[],maxP=projs[0]?.c||1;
+  document.getElementById('analysis-projs').innerHTML=projs.map(p=>\`
+    <div class="pat-item">
+      <div class="pat-title">\${p.project}</div>
+      <div class="pat-sub">\${p.c} issues</div>
+      <div style="margin-top:5px;background:var(--bg4);border-radius:2px;height:3px;overflow:hidden"><div style="height:100%;width:\${Math.round((p.c/maxP)*100)}%;background:var(--teal);border-radius:2px"></div></div>
+    </div>\`).join('');
+  // Recos
+  const recos=r.recommendations||buildRecos(s);
+  document.getElementById('analysis-reco-card').classList.remove('hidden');
+  document.getElementById('reco-grid').innerHTML=recos.slice(0,3).map(rec=>{
+    const col=rec.priority==='immediate'?'var(--red)':rec.priority==='short_term'?'var(--orange)':'var(--green)';
+    return \`<div class="reco" style="border-top:2px solid \${col}">
+      <div class="reco-prio" style="color:\${col}">\${(rec.priority||'').replace('_',' ')}</div>
+      <div class="reco-action">\${rec.action}</div>
+      <div class="reco-why">\${rec.rationale}</div>
+    </div>\`;
+  }).join('');
 }
 
-// ── Analysis tab ──────────────────────────────────────────────────────────────
-function renderAnalysis() {
-  const s = state.stats;
-  if (!s.total) { loadAll(); return; }
+function buildRecos(s){
+  const r=[];
+  if(s.critical>0)r.push({priority:'immediate',action:\`Resolve \${s.critical} critical issue\${s.critical>1?'s':''}\`,rationale:\`\${s.critical} critical issue\${s.critical>1?'s are':' is'} blocking safe release.\`});
+  const sec=(s.byCat||[]).find(c=>c.category==='security')?.c||0;
+  if(sec>0)r.push({priority:'short_term',action:'Add SAST scanning to CI pipeline',rationale:\`\${sec} security issue\${sec>1?'s':''} detected. Automated scanning prevents future regressions.\`});
+  r.push({priority:'long_term',action:'Run regular retrospectives',rationale:'Prevents issues from becoming entrenched patterns across projects.'});
+  return r;
+}
 
-  document.getElementById('health-score').textContent = s.health;
-  document.getElementById('analysis-title').textContent = 'AI Analysis · Sprint 14';
-  document.getElementById('analysis-summary-text').innerHTML =
-    \`Analysed <strong>\${s.total}</strong> issues across <strong>\${(s.byProj||[]).length}</strong> project(s). \` +
-    \`Currently <strong style="color:var(--red)">\${s.critical} critical</strong> and \` +
-    \`<strong style="color:var(--orange)">\${(s.bySev||[]).find(x=>x.severity==='high')?.c||0} high</strong> severity issues are open. \` +
-    \`Team health score is <strong style="color:\${parseFloat(s.health) >= 7 ? 'var(--green)' : parseFloat(s.health) >= 4 ? 'var(--yellow)' : 'var(--red)'}">\` +
-    \`\${s.health}/10</strong> based on issue density and severity distribution.\`;
+function renderAnalysis(){
+  const s=S.stats;if(!s.total)return;
+  document.getElementById('health-score').textContent=s.health;
+  document.getElementById('analysis-metrics').innerHTML=[
+    {l:'Total',v:s.total,c:'var(--text)'},{l:'Open',v:s.open,c:'var(--orange)'},{l:'Critical',v:s.critical,c:'var(--red)'},{l:'Resolved',v:s.resolved,c:'var(--green)'}
+  ].map(m=>\`<div class="hm"><div class="hm-val" style="color:\${m.c}">\${m.v}</div><div class="hm-lbl">\${m.l}</div></div>\`).join('');
+}
 
-  // Metrics row
-  document.getElementById('analysis-metrics').innerHTML = [
-    { label: 'total', val: s.total, color: 'var(--text)' },
-    { label: 'open', val: s.open, color: 'var(--orange)' },
-    { label: 'critical', val: s.critical, color: 'var(--red)' },
-    { label: 'resolved', val: s.resolved, color: 'var(--green)' },
-  ].map(m => \`
-    <div>
-      <div style="font-size:28px;font-weight:800;font-family:var(--font-display);color:\${m.color}">\${m.val}</div>
-      <div style="font-size:10px;color:var(--text3);text-transform:uppercase;letter-spacing:.6px;margin-top:2px">\${m.label}</div>
-    </div>\`).join('');
+// ── Patterns ───────────────────────────────────────────────────────────────
+function renderPatterns(){renderVel();renderSprTbl();renderComp();}
+document.querySelectorAll('[data-psub]').forEach(b=>b.addEventListener('click',()=>{
+  document.querySelectorAll('[data-psub]').forEach(x=>x.classList.remove('active'));b.classList.add('active');
+  document.querySelectorAll('.psub').forEach(p=>{p.classList.remove('active');});
+  document.getElementById('psub-'+b.dataset.psub)?.classList.add('active');
+}));
+document.getElementById('pattern-project-select')?.addEventListener('change',async e=>{
+  S.sprints=await call('GET',\`/sprints?project=\${e.target.value}\`);
+  renderVel();renderSprTbl();renderComp();
+});
 
-  // Grid
-  const grid = document.getElementById('analysis-grid');
-  grid.style.display = 'grid';
-
-  const cats = (s.byCat || []).slice(0, 5);
-  const maxC = cats[0]?.c || 1;
-  const catGrads = {
-    technical:'linear-gradient(90deg,#6c63ff,#8b85ff)',process:'linear-gradient(90deg,#ff9933,#ffb84d)',
-    security:'linear-gradient(90deg,#ff4d4d,#ff7a7a)',quality:'linear-gradient(90deg,#4d9fff,#7ab8ff)',
-    environment:'linear-gradient(90deg,#26c6b0,#4de0ce)',
-  };
-  document.getElementById('analysis-cats').innerHTML = cats.map(c => \`
-    <div class="pattern-item" style="border-left-color:\${catGrads[c.category]?.split(',')[1]?.split(')')[0]||'var(--accent)'}">
-      <div class="pattern-title">\${c.category || 'other'}</div>
-      <div class="pattern-sub">\${c.c} issue\${c.c !== 1 ? 's' : ''}</div>
-      <div style="margin-top:6px;background:var(--bg4);border-radius:3px;height:4px;overflow:hidden">
-        <div style="height:100%;width:\${Math.round((c.c/maxC)*100)}%;background:\${catGrads[c.category]||'var(--accent)'};border-radius:3px"></div>
+function velColor(v){return v>=7?'var(--green)':v>=4?'var(--yellow)':'var(--red)';}
+function renderVel(){
+  const sp=S.sprints,w=document.getElementById('velocity-chart-wrap');if(!w||!sp.length)return;
+  w.innerHTML=\`<div class="vel-bars" style="height:120px;width:100%">\${sp.map(s=>{
+    const p=(s.velocity_score/10)*100,c=velColor(s.velocity_score);
+    return \`<div class="vel-col"><div class="vel-num" style="color:\${c}">\${s.velocity_score}</div><div class="vel-fill" style="height:\${p}%;background:\${c};min-height:4px"></div><div class="vel-lbl">\${s.sprint_label.replace('Sprint','S')}</div></div>\`;
+  }).join('')}</div>\`;
+  const last=sp[sp.length-1]||{},prev=sp[sp.length-2]||{};
+  const tr=last.velocity_score>(prev.velocity_score||0)?'↑':last.velocity_score<(prev.velocity_score||0)?'↓':'→';
+  const tc=tr==='↑'?'var(--green)':tr==='↓'?'var(--red)':'var(--text3)';
+  document.getElementById('pattern-kpis').innerHTML=\`
+    <div class="kpi kpi-green"><div class="kpi-label">Latest Velocity</div><div class="kpi-value c-green">\${last.velocity_score||'—'}</div><div class="kpi-sub">/ 10</div><div class="kpi-ghost">\${last.velocity_score||''}</div></div>
+    <div class="kpi kpi-\${tr==='↑'?'green':'red'}"><div class="kpi-label">Trend</div><div class="kpi-value" style="color:\${tc};font-size:32px">\${tr}</div><div class="kpi-sub">vs previous</div></div>
+    <div class="kpi kpi-orange"><div class="kpi-label">Critical (latest)</div><div class="kpi-value c-orange">\${last.critical||0}</div><div class="kpi-sub">in \${last.sprint_label||'—'}</div><div class="kpi-ghost">\${last.critical||0}</div></div>
+    <div class="kpi kpi-accent"><div class="kpi-label">Periods Tracked</div><div class="kpi-value c-accent">\${sp.length}</div><div class="kpi-sub">\${sp[0]?.sprint_label||'—'} → now</div></div>\`;
+}
+function renderComp(){
+  const sp=S.sprints,w=document.getElementById('composition-chart-wrap');if(!w||!sp.length)return;
+  const mx=Math.max(...sp.map(s=>s.total_issues))||1;
+  w.innerHTML=\`<div class="comp-bars" style="height:130px;width:100%">\${sp.map(s=>{
+    const ch=Math.round((s.critical/mx)*120),hh=Math.round((s.high/mx)*120),th=Math.round((s.total_issues/mx)*120);
+    return \`<div class="comp-col">
+      <div style="font-size:9px;font-family:var(--font-m);color:var(--text3)">\${s.total_issues}</div>
+      <div class="comp-stk" style="height:\${th}px;min-height:4px">
+        <div style="height:\${ch}px;background:var(--red);min-height:\${s.critical?3:0}px"></div>
+        <div style="height:\${hh}px;background:var(--orange);min-height:\${s.high?3:0}px"></div>
+        <div style="flex:1;background:var(--blue);opacity:.5"></div>
       </div>
-    </div>\`).join('');
-
-  const projs = (s.byProj || []);
-  const maxP  = projs[0]?.c || 1;
-  document.getElementById('analysis-projs').innerHTML = projs.map(p => \`
-    <div class="pattern-item">
-      <div class="pattern-title">\${p.project}</div>
-      <div class="pattern-sub">\${p.c} total issues</div>
-      <div style="margin-top:6px;background:var(--bg4);border-radius:3px;height:4px;overflow:hidden">
-        <div style="height:100%;width:\${Math.round((p.c/maxP)*100)}%;background:var(--accent);border-radius:3px"></div>
-      </div>
-    </div>\`).join('');
-
-  // Recommendations
-  const recos = buildRecommendations(s);
-  const recoCard = document.getElementById('analysis-reco-card');
-  recoCard.style.display = 'block';
-  document.getElementById('reco-grid').innerHTML = recos.map(r => \`
-    <div class="reco-card" style="border-top:2px solid \${r.color}">
-      <div class="reco-prio" style="color:\${r.color}">\${r.priority}</div>
-      <div class="reco-action">\${r.action}</div>
-      <div class="reco-rationale">\${r.rationale}</div>
-    </div>\`).join('');
+      <div class="vel-lbl">\${s.sprint_label.replace('Sprint','S')}</div>
+    </div>\`;
+  }).join('')}</div>\`;
+}
+function renderSprTbl(){
+  const tb=document.getElementById('sprint-tbody');if(!tb)return;
+  const sp=[...S.sprints].reverse();
+  if(!sp.length){tb.innerHTML=\`<tr><td colspan="9"><div class="empty"><div class="empty-icon">◉</div><div class="empty-title">No data</div></div></td></tr>\`;return;}
+  tb.innerHTML=sp.map(s=>\`<tr>
+    <td style="font-family:var(--font-m);color:var(--accent2)">\${s.sprint_label}</td>
+    <td style="font-family:var(--font-m)">\${s.total_issues}</td>
+    <td style="font-family:var(--font-m);color:\${s.critical>2?'var(--red)':'var(--text)'};font-weight:\${s.critical>2?600:400}">\${s.critical}</td>
+    <td style="font-family:var(--font-m);color:var(--orange)">\${s.high}</td>
+    <td style="font-family:var(--font-m);color:var(--blue)">\${s.medium}</td>
+    <td style="font-family:var(--font-m);color:var(--text3)">\${s.low}</td>
+    <td style="font-family:var(--font-m);color:var(--green)">\${s.resolved}</td>
+    <td>\${s.top_category?\`<span class="cat">\${s.top_category}</span>\`:'—'}</td>
+    <td><div style="display:flex;align-items:center;gap:6px"><div class="vel-bar"><div class="vel-bar-fill" style="width:\${(s.velocity_score/10)*100}%;background:\${velColor(s.velocity_score)}"></div></div><span style="font-family:var(--font-m);font-size:11px;color:\${velColor(s.velocity_score)}">\${s.velocity_score}</span></div></td>
+  </tr>\`).join('');
 }
 
-function buildRecommendations(s) {
-  const recs = [];
-  if (s.critical > 0) recs.push({ priority: 'Immediate', color: 'var(--red)',
-    action: \`Resolve \${s.critical} critical issue\${s.critical > 1 ? 's' : ''}\`,
-    rationale: \`\${s.critical} critical issue\${s.critical > 1 ? 's are' : ' is'} blocking safe release. Patch before next deployment.\` });
-
-  const secCount = (s.byCat||[]).find(c => c.category === 'security')?.c || 0;
-  if (secCount > 0) recs.push({ priority: 'Short term', color: 'var(--orange)',
-    action: 'Add SAST scanning to CI pipeline',
-    rationale: \`\${secCount} security issue\${secCount > 1 ? 's' : ''} detected. Automated scanning would catch these before merge.\` });
-
-  const procCount = (s.byCat||[]).find(c => c.category === 'process')?.c || 0;
-  if (procCount > 1) recs.push({ priority: 'Short term', color: 'var(--orange)',
-    action: 'Introduce PR review SLA and CODEOWNERS',
-    rationale: \`\${procCount} process issues indicate review bottlenecks. A 24h SLA and auto-assignment will unblock velocity.\` });
-
-  if (recs.length < 3) recs.push({ priority: 'Long term', color: 'var(--green)',
-    action: 'Establish sprint retrospective cadence',
-    rationale: 'Regular retrospectives prevent issues from becoming entrenched patterns across sprints.' });
-
-  return recs.slice(0, 3);
-}
-
-// ── Patterns tab ──────────────────────────────────────────────────────────────
-function renderPatterns() {
-  renderVelocityChart();
-  renderSprintTable();
-  renderCompositionChart();
-}
-
-// Sub-tab nav
-document.querySelectorAll('[data-psub]').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('[data-psub]').forEach(b => b.classList.remove('active'));
-    btn.classList.add('active');
-    document.querySelectorAll('.psub').forEach(p => { p.classList.remove('active'); p.classList.add('hidden'); });
-    const panel = document.getElementById('psub-' + btn.dataset.psub);
-    if (panel) { panel.classList.remove('hidden'); panel.classList.add('active'); }
-  });
-});
-
-document.getElementById('pattern-project-select')?.addEventListener('change', async (e) => {
-  const sprints = await api('GET', \`/sprints?project=\${e.target.value}\`);
-  state.sprints = sprints;
-  renderVelocityChart();
-  renderSprintTable();
-  renderCompositionChart();
-});
-
-function renderVelocityChart() {
-  const sprints = state.sprints;
-  const wrap    = document.getElementById('velocity-chart-wrap');
-  if (!wrap || !sprints.length) return;
-
-  const maxV = 10;
-  wrap.innerHTML = \`<div class="vel-bar-wrap" style="height:120px">\${
-    sprints.map(s => {
-      const pct   = (s.velocity_score / maxV) * 100;
-      const color = s.velocity_score >= 7 ? 'var(--green)' : s.velocity_score >= 4 ? 'var(--yellow)' : 'var(--red)';
-      return \`
-        <div class="vel-bar-col">
-          <div class="vel-bar-val" style="color:\${color}">\${s.velocity_score}</div>
-          <div class="vel-bar-fill" style="height:\${pct}%;background:\${color};width:100%;border-radius:4px 4px 0 0;min-height:4px"></div>
-          <div class="vel-bar-label">\${s.sprint_label.replace('Sprint ', 'S')}</div>
-        </div>\`;
-    }).join('')
-  }</div>\`;
-
-  // KPIs below
-  const last = sprints[sprints.length - 1] || {};
-  const prev = sprints[sprints.length - 2] || {};
-  const trend = last.velocity_score > (prev.velocity_score || 0) ? '↑' : last.velocity_score < (prev.velocity_score || 0) ? '↓' : '→';
-  const trendColor = trend === '↑' ? 'var(--green)' : trend === '↓' ? 'var(--red)' : 'var(--text3)';
-  document.getElementById('pattern-kpis').innerHTML = \`
-    <div class="kpi-card green"><div class="kpi-label">Latest Velocity</div><div class="kpi-value green">\${last.velocity_score || '—'}</div><div class="kpi-sub">/ 10 score</div><div class="kpi-bg-num">\${last.velocity_score || ''}</div></div>
-    <div class="kpi-card \${trend === '↑' ? 'green' : 'red'}"><div class="kpi-label">Trend</div><div class="kpi-value \${trend === '↑' ? 'green' : 'red'}" style="color:\${trendColor}">\${trend}</div><div class="kpi-sub">vs prev sprint</div></div>
-    <div class="kpi-card orange"><div class="kpi-label">Critical (latest)</div><div class="kpi-value orange">\${last.critical || 0}</div><div class="kpi-sub">in \${last.sprint_label || '—'}</div><div class="kpi-bg-num">\${last.critical || 0}</div></div>
-    <div class="kpi-card accent"><div class="kpi-label">Sprints Tracked</div><div class="kpi-value accent">\${sprints.length}</div><div class="kpi-sub">\${sprints[0]?.sprint_label || '—'} → now</div></div>
-  \`;
-}
-
-function renderCompositionChart() {
-  const sprints = state.sprints;
-  const wrap    = document.getElementById('composition-chart-wrap');
-  if (!wrap || !sprints.length) return;
-
-  const maxT = Math.max(...sprints.map(s => s.total_issues)) || 1;
-  wrap.innerHTML = \`<div class="comp-bar-wrap" style="height:140px">\${
-    sprints.map(s => {
-      const ch = Math.round((s.critical / maxT) * 120);
-      const hh = Math.round((s.high     / maxT) * 120);
-      return \`
-        <div class="comp-bar-col">
-          <div style="font-size:9px;font-family:var(--font-mono);color:var(--text3)">\${s.total_issues}</div>
-          <div class="comp-stacked" style="height:\${Math.round((s.total_issues/maxT)*120)}px;min-height:4px">
-            <div style="height:\${ch}px;background:var(--red);min-height:\${s.critical?4:0}px"></div>
-            <div style="height:\${hh}px;background:var(--orange);min-height:\${s.high?4:0}px"></div>
-            <div style="flex:1;background:var(--blue);opacity:.5"></div>
-          </div>
-          <div class="vel-bar-label">\${s.sprint_label.replace('Sprint ', 'S')}</div>
-        </div>\`;
-    }).join('')
-  }</div>
-  <div style="display:flex;gap:14px;margin-top:8px;font-size:10px;color:var(--text3)">
-    <span><span style="color:var(--red)">■</span> Critical</span>
-    <span><span style="color:var(--orange)">■</span> High</span>
-    <span><span style="color:var(--blue);opacity:.6">■</span> Medium+Low</span>
-  </div>\`;
-}
-
-function renderSprintTable() {
-  const tbody = document.getElementById('sprint-tbody');
-  if (!tbody) return;
-  const sprints = [...state.sprints].reverse();
-  if (!sprints.length) {
-    tbody.innerHTML = \`<tr><td colspan="9"><div class="empty-state"><big>◉</big>No sprint data loaded</div></td></tr>\`;
-    return;
-  }
-  const velColor = v => v >= 7 ? 'var(--green)' : v >= 4 ? 'var(--yellow)' : 'var(--red)';
-  tbody.innerHTML = sprints.map(s => \`
-    <tr>
-      <td style="font-family:var(--font-mono);color:var(--accent2)">\${s.sprint_label}</td>
-      <td style="font-family:var(--font-mono)">\${s.total_issues}</td>
-      <td style="font-family:var(--font-mono);color:\${s.critical > 2 ? 'var(--red)' : 'var(--text)'};font-weight:\${s.critical > 2 ? 700 : 400}">\${s.critical}</td>
-      <td style="font-family:var(--font-mono);color:var(--orange)">\${s.high}</td>
-      <td style="font-family:var(--font-mono);color:var(--blue)">\${s.medium}</td>
-      <td style="font-family:var(--font-mono);color:var(--text2)">\${s.low}</td>
-      <td style="font-family:var(--font-mono);color:var(--green)">\${s.resolved}</td>
-      <td>\${s.top_category ? \`<span class="cat-tag">\${s.top_category}</span>\` : '—'}</td>
-      <td>
-        <div style="display:flex;align-items:center;gap:7px">
-          <div style="width:50px;height:5px;background:var(--bg4);border-radius:3px;overflow:hidden">
-            <div style="width:\${(s.velocity_score/10)*100}%;height:100%;background:\${velColor(s.velocity_score)};border-radius:3px"></div>
-          </div>
-          <span style="font-family:var(--font-mono);font-size:11px;color:\${velColor(s.velocity_score)}">\${s.velocity_score}</span>
-        </div>
-      </td>
-    </tr>\`).join('');
-}
-
-// ── Document tab ──────────────────────────────────────────────────────────────
-function renderDocument() {
-  const s   = state.stats;
-  if (!s.total) return;
-  const now = new Date().toLocaleDateString('en-IN', { dateStyle: 'long' });
-  document.getElementById('doc-filename').textContent = \`issueai-report-\${now.replace(/ /g,'-')}.md\`;
-  document.getElementById('doc-meta').textContent = \`Generated \${now} · \${s.total} issues · Live data\`;
-  document.getElementById('btn-download-report').href = '/api/report';
-
-  // Render preview in doc-body
-  const issues = state.issues.filter(i => i.status === 'open').slice(0, 8);
-  document.getElementById('doc-body').innerHTML = \`
-    <div class="md-h1">Project Issues Intelligence Report</div>
-    <div class="md-p"><strong>Generated:</strong> \${now} &nbsp;|&nbsp; <strong>Projects:</strong> \${(s.byProj||[]).map(p=>p.project).join(', ')} &nbsp;|&nbsp; <strong>Total Issues:</strong> \${s.total}</div>
-
+// ── Document ───────────────────────────────────────────────────────────────
+function renderDoc(){
+  const s=S.stats;if(!s.total)return;
+  const now=new Date().toLocaleDateString('en-IN',{dateStyle:'long'});
+  document.getElementById('doc-filename').textContent=\`issueai-report-\${now.replace(/ /g,'-')}.md\`;
+  document.getElementById('doc-meta').textContent=\`\${now} · \${s.total} issues · Live data\`;
+  const issues=S.issues.filter(i=>i.status==='open').slice(0,8);
+  document.getElementById('doc-body').innerHTML=\`
+    <div class="md-h1">Project Issues Report</div>
+    <div class="md-p"><strong>Generated:</strong> \${now} &nbsp;|&nbsp; <strong>Projects:</strong> \${(s.byProj||[]).map(p=>p.project).join(', ')} &nbsp;|&nbsp; <strong>Total:</strong> \${s.total}</div>
     <div class="md-h2">1. Executive Summary</div>
-    <div class="md-p">This report covers <strong>\${s.total} total issues</strong> across \${(s.byProj||[]).length} project(s). Currently <strong style="color:var(--red)">\${s.open} issues are open</strong> including <strong style="color:var(--red)">\${s.critical} critical</strong> requiring immediate attention. Team health score is <strong>\${s.health}/10</strong>.</div>
-
+    <div class="md-p"><strong>\${s.total} total issues</strong> across \${(s.byProj||[]).length} project(s). <strong style="color:var(--red)">\${s.open} open</strong> including <strong style="color:var(--red)">\${s.critical} critical</strong>. Team health: <strong>\${s.health}/10</strong>.</div>
     <div class="md-h2">2. Key Metrics</div>
-    <table class="md-table">
-      <tr><th>Metric</th><th>Value</th></tr>
-      <tr><td>Total Issues</td><td>\${s.total}</td></tr>
-      <tr><td>Open</td><td>\${s.open}</td></tr>
-      <tr><td>Critical (open)</td><td><span class="md-badge c">\${s.critical}</span></td></tr>
-      <tr><td>Resolved</td><td>\${s.resolved}</td></tr>
-      <tr><td>Team Health Score</td><td>\${s.health} / 10</td></tr>
-    </table>
-
+    <table class="md-table"><tr><th>Metric</th><th>Value</th></tr>
+    <tr><td>Total</td><td>\${s.total}</td></tr><tr><td>Open</td><td>\${s.open}</td></tr>
+    <tr><td>Critical</td><td><span class="mdb c">\${s.critical}</span></td></tr>
+    <tr><td>Resolved</td><td>\${s.resolved}</td></tr><tr><td>Health</td><td>\${s.health}/10</td></tr></table>
     <div class="md-h2">3. Top Open Issues</div>
-    <table class="md-table">
-      <tr><th>#</th><th>Title</th><th>Project</th><th>Severity</th><th>Category</th></tr>
-      \${issues.map((i, idx) => \`
-        <tr>
-          <td>\${idx+1}</td>
-          <td>\${esc(i.title)}</td>
-          <td>\${esc(i.project)}</td>
-          <td><span class="md-badge \${i.severity[0]}">\${i.severity}</span></td>
-          <td>\${i.category || '—'}</td>
-        </tr>\`).join('')}
-    </table>
-
+    <table class="md-table"><tr><th>#</th><th>Title</th><th>Project</th><th>Severity</th><th>Category</th></tr>
+    \${issues.map((i,n)=>\`<tr><td>\${n+1}</td><td>\${esc(i.title)}</td><td>\${esc(i.project)}</td><td><span class="mdb \${i.severity[0]}">\${i.severity}</span></td><td>\${i.category||'—'}</td></tr>\`).join('')}</table>
     <div class="md-h2">4. Recommendations</div>
     <ul class="md-ul">
-      \${s.critical > 0 ? \`<li><strong>Immediate:</strong> Resolve \${s.critical} critical issue\${s.critical>1?'s':''} before next release</li>\` : ''}
-      <li><strong>Short term:</strong> Add automated security scanning (SAST) to CI pipeline</li>
-      <li><strong>Short term:</strong> Enforce PR review SLA and introduce CODEOWNERS</li>
-      <li><strong>Long term:</strong> Run retrospectives to prevent issues becoming recurring patterns</li>
+      \${s.critical>0?\`<li><strong>Immediate:</strong> Resolve \${s.critical} critical issue\${s.critical>1?'s':''} before next release</li>\`:''}
+      <li><strong>Short term:</strong> Add SAST scanning to CI pipeline</li>
+      <li><strong>Short term:</strong> Enforce PR review SLA and CODEOWNERS</li>
+      <li><strong>Long term:</strong> Run retrospectives to surface recurring patterns</li>
     </ul>
-
-    <div style="margin-top:24px;padding-top:14px;border-top:1px solid var(--border);font-size:11px;color:var(--text3)">
-      <em>Report generated by IssueAI · Open Source Project Intelligence · <a href="/api/report" download style="color:var(--accent)">Download full .md</a></em>
-    </div>
-  \`;
+    <div style="margin-top:20px;padding-top:12px;border-top:1px solid var(--border);font-size:11px;color:var(--text3)">
+      <em>IssueAI · <a href="/api/report" download style="color:var(--accent2)">Download full .md</a> · <button onclick="aiReport()" style="background:none;border:none;color:var(--accent2);cursor:pointer;font-size:11px;padding:0">⚡ Generate AI report</button></em>
+    </div>\`;
 }
 
-// ── Copy report ───────────────────────────────────────────────────────────────
-document.getElementById('btn-copy-report')?.addEventListener('click', async () => {
-  try {
-    const res  = await fetch('/api/report');
-    const text = await res.text();
-    await navigator.clipboard.writeText(text);
-    toast('Report copied to clipboard');
-  } catch (e) { toast('Copy failed — try Download instead', 'err'); }
+// ── AI Report ─────────────────────────────────────────────────────────────
+document.getElementById('btn-ai-report')?.addEventListener('click',aiReport);
+async function aiReport(){
+  if(!S.aiConfigured){toast('Add OPENROUTER_API_KEY to enable AI reports','err');return;}
+  toast('Generating AI report…','info');
+  try{
+    const r=await fetch('/api/ai/report',{method:'POST'});
+    if(!r.ok)throw new Error('AI report failed');
+    const md=await r.text();
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(new Blob([md],{type:'text/markdown'}));
+    a.download='issueai-ai-report.md';a.click();
+    toast('AI report downloaded ✓');
+    document.getElementById('nav-doc-badge').style.display='';
+  }catch(e){toast(e.message,'err');}
+}
+
+document.getElementById('btn-copy-report')?.addEventListener('click',async()=>{
+  try{const r=await fetch('/api/report');const t=await r.text();await navigator.clipboard.writeText(t);toast('Copied to clipboard ✓');}
+  catch(e){toast('Copy failed','err');}
 });
 
-// ── Refresh stats ─────────────────────────────────────────────────────────────
-async function refreshStats() {
-  state.stats = await api('GET', '/stats');
-  const badge = document.getElementById('nav-badge-issues');
-  if (badge) badge.textContent = state.stats.open || state.issues.length;
-  if (state.currentTab === 'dashboard') renderDashboard();
+// ── Refresh stats ──────────────────────────────────────────────────────────
+async function refreshStats(){
+  S.stats=await call('GET','/stats');
+  const b=document.getElementById('nav-issues-badge');
+  if(b)b.textContent=S.stats.open||S.issues.length;
+  if(S.tab==='dashboard')renderDashboard();
 }
 
-// ── HTML escape ───────────────────────────────────────────────────────────────
-function esc(str) {
-  return (str || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-}
+function esc(s){return(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 
-// ── Init ──────────────────────────────────────────────────────────────────────
-(async () => {
+// ── Init ───────────────────────────────────────────────────────────────────
+(async()=>{
   await loadAll();
-  // Animate bar fills
-  setTimeout(() => {
-    document.querySelectorAll('.bar-fill').forEach(b => {
-      const w = b.style.width;
-      b.style.width = '0';
-      requestAnimationFrame(() => { setTimeout(() => { b.style.width = w; }, 50); });
-    });
-  }, 200);
+  setTimeout(()=>{
+    document.querySelectorAll('.bc-fill').forEach(b=>{const w=b.style.width;b.style.width='0';requestAnimationFrame(()=>setTimeout(()=>{b.style.width=w;},40));});
+  },200);
 })();
-
 </script>
 </body>
 </html>
